@@ -19,11 +19,20 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck tpm2-tools
       - name: Check Go module
         run: ./tools/check-go.sh
       - name: Check shell scripts
         run: shellcheck tools/*.sh
+      - name: TPM simulator and tpm2_eventlog compatibility
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -o pipefail
+          go test -tags=tpmsimulator -count=1 -v ./... | tee simulator.log
+          ./tools/check-simulator-log.sh simulator.log
+          go test -tags=tpmsimulator,attestux_simulator -count=1 -v ./... | tee simulator-trust.log
+          ./tools/check-simulator-log.sh simulator-trust.log
 
   mobile:
     runs-on: ubuntu-24.04
