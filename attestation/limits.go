@@ -9,11 +9,9 @@ const (
 	minEventLogSize   = 32
 	maxAKPublicSize   = 64 << 10
 	maxAKCreationSize = 64 << 10
-	// This limit applies to the whole encoded activation message.
-	MaxActivationMessageSize = frame.MaxControlPayload
-	maxQuoteSize             = 64 << 10
-	minNonceSize             = 16
-	MaxNonceSize             = 32
+	// Key discovery and credential activation share this encoded control-payload limit.
+	MaxControlMessageSize = frame.MaxControlPayload
+	maxQuoteSize          = 64 << 10
 
 	AttestedPCRCount = 16
 	MaxPCRCount      = 24

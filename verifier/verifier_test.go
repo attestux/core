@@ -11,15 +11,16 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/attestux/core/attestation"
 	"github.com/attestux/core/attestation/attestationtest"
 	"github.com/attestux/core/verifier/testtrust"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"github.com/google/go-attestation/attest"
 	legacytpm2 "github.com/google/go-tpm/legacy/tpm2"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -33,178 +34,169 @@ func TestUnsupportedPCRBankWarningNamesTheBank(t *testing.T) {
 	}
 }
 
-func TestRejectActivationClearsSessionSecrets(t *testing.T) {
-	session := newActivationTestSession(t)
-	secret := session.expectedSecret
+func TestRejectActivationClearsTheQuoteChallenge(t *testing.T) {
+	session, _, _ := newQuoteTestSession(t)
+	nonce := session.expectedQuoteNonce
 	report, err := session.RejectActivation()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if report.Status !=
 		attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-		!containsMessage(report.Errors, "prover reported") {
+		!slices.Equal(report.Errors, []string{"TPM credential activation failed: prover reported credential activation failure"}) {
 		t.Fatalf("unexpected rejected report: %v", report)
 	}
-	requireActivationFinished(t, session, secret)
+	requireActivationFinished(t, session, nonce)
 }
 
-func TestPrepareVerificationReportsInvalidEvidence(t *testing.T) {
-	e := attestationtest.MinimallyShapedEvidence()
-	e.EndorsementKeys = nil
-	session, err := PrepareVerification(marshalEvidence(t, e), bytes.Repeat([]byte{2}, 20))
+func TestRejectEvidenceReportsAttestationFailure(t *testing.T) {
+	session, _, _ := newQuoteTestSession(t)
+	nonce := session.expectedQuoteNonce
+	initial := session.Report()
+	report, err := session.RejectEvidence()
 	if err != nil {
 		t.Fatal(err)
 	}
-	report := session.Report()
-	if report.Status !=
-		attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-		!containsMessage(report.Errors, "invalid endorsement-key count") {
-		t.Fatalf("invalid evidence was accepted: %v", report)
+	if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
+		!slices.Equal(report.Errors, []string{"prover reported attestation failure"}) || describesTrust(report) ||
+		!bytes.Equal(report.EvidenceSha256, initial.EvidenceSha256) {
+		t.Fatalf("incorrect attestation-failure report: %v", report)
+	}
+	requireActivationFinished(t, session, nonce)
+}
+
+func TestPrepareVerificationReportsInvalidKeys(t *testing.T) {
+	e := attestationtest.MinimallyShapedEvidence()
+	e.Keys.EndorsementKeys = nil
+	session := PrepareVerification(marshalHello(t, e.Keys))
+	if report := session.Report(); report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED || !containsMessage(report.Errors, "invalid endorsement-key count") {
+		t.Fatalf("invalid keys were accepted: %v", report)
 	}
 }
 
-func TestPrepareVerificationRejectsEvidenceOutsideSizeRange(t *testing.T) {
-	for _, size := range []int{0, attestation.MaxEvidenceSize + 1} {
-		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
-			session, err := PrepareVerification(make([]byte, size), make([]byte, 20))
-			if err != nil {
-				t.Fatal(err)
+func TestPrepareVerificationRejectsEmptyHello(t *testing.T) {
+	session := PrepareVerification(nil)
+	report := session.Report()
+	if session.ActivationChallenge() != nil || len(report.Errors) != 1 ||
+		!strings.Contains(report.Errors[0], "size 0 is outside permitted range") {
+		t.Fatalf("empty hello was not rejected by size: %v", report)
+	}
+}
+
+func TestPrepareVerificationHelloSizeBoundary(t *testing.T) {
+	fixture := newEndorsementCertificateFixture(t)
+	evidence := softwareEvidenceWithFixture(t, fixture, nil)
+	hello := marshalHello(t, evidence.Keys)
+	for _, test := range []struct {
+		name     string
+		size     int
+		accepted bool
+	}{
+		{"below limit", attestation.MaxControlMessageSize - 1, true},
+		{"at limit", attestation.MaxControlMessageSize, true},
+		{"above limit", attestation.MaxControlMessageSize + 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Pad with a valid unknown field; the keys and their proofs stay intact.
+			paddingSize := test.size - len(hello) - protowire.SizeTag(100) - protowire.SizeVarint(uint64(test.size))
+			raw := protowire.AppendTag(bytes.Clone(hello), 100, protowire.BytesType)
+			raw = protowire.AppendBytes(raw, make([]byte, paddingSize))
+			if len(raw) != test.size {
+				t.Fatalf("padded hello size = %d, want %d", len(raw), test.size)
 			}
+			session := prepareVerificationWithPolicies(raw, []verificationPolicy{fixture.policy()}, fixture.now)
+			defer session.Cancel()
 			report := session.Report()
-			if session.ActivationChallenge() != nil || len(report.Errors) != 1 ||
-				!strings.Contains(report.Errors[0], fmt.Sprintf("size %d is outside permitted range", size)) {
-				t.Fatalf("evidence of %d bytes was not rejected by size: %v", size, report)
+			if sum := sha256.Sum256(raw); !bytes.Equal(report.EvidenceSha256, sum[:]) {
+				t.Fatal("report did not hash the complete padded hello")
+			}
+			if test.accepted {
+				if session.ActivationChallenge() == nil || len(report.Errors) != 0 ||
+					report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION {
+					t.Fatalf("hello of %d bytes did not reach pending activation: %v", test.size, report)
+				}
+			} else {
+				want := fmt.Sprintf("malformed attestation hello: size %d is outside permitted range", test.size)
+				if session.ActivationChallenge() != nil ||
+					report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
+					!slices.Equal(report.Errors, []string{want}) {
+					t.Fatalf("hello of %d bytes was not rejected by size: %v", test.size, report)
+				}
 			}
 		})
 	}
 }
 
+func TestPrepareVerificationRejectsHelloWithoutKeys(t *testing.T) {
+	// A future optional field makes the hello nonempty without supplying keys.
+	raw := []byte{0x12, 1, 0x55}
+	session := PrepareVerification(raw)
+	report := session.Report()
+	if session.ActivationChallenge() != nil || report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
+		!containsMessage(report.Errors, "missing attestation keys") {
+		t.Fatalf("hello without keys was not rejected: %v", report)
+	}
+	if _, err := CompletionForReport(report); err != nil {
+		t.Fatal(err)
+	}
+	if sum := sha256.Sum256(raw); !bytes.Equal(report.EvidenceSha256, sum[:]) {
+		t.Fatal("early rejection report did not hash the full raw hello")
+	}
+}
+
 func TestFailReportBoundsTheDiagnostic(t *testing.T) {
-	report := &attestuxv1.VerificationReport{}
+	report := &resultv1.VerificationReport{}
 	failReport(report, "%s", strings.Repeat("e", maxDiagnosticMessageBytes+1))
 	if got := len(report.Errors[0]); got != maxDiagnosticMessageBytes+len("...") {
 		t.Fatalf("diagnostic length = %d, want the %d byte cap plus an ellipsis", got, maxDiagnosticMessageBytes)
 	}
 }
 
-func TestPrepareVerificationRejectsInvalidExpectedNonce(t *testing.T) {
-	for _, size := range []int{0, 15, attestation.MaxNonceSize + 1} {
-		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
-			if _, err := PrepareVerification(
-				[]byte{1},
-				make([]byte, size),
-			); err == nil || !strings.Contains(err.Error(), "expected nonce") {
-				t.Fatalf("invalid expected nonce returned %v", err)
-			}
-		})
+func TestPrepareVerificationDoesNotExposeTheExpectedNonce(t *testing.T) {
+	session, _, _ := newQuoteTestSession(t)
+	defer session.Cancel()
+	wire, err := proto.Marshal(session.ActivationChallenge())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(session.expectedQuoteNonce) != sha256.Size || bytes.Contains(wire, session.expectedQuoteNonce) {
+		t.Fatal("activation challenge exposes its quote nonce")
 	}
 }
 
-func TestCompleteActivationBytesAcceptsOnlyAValidResponse(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		response  func(t testing.TB, expected []byte) []byte
-		wantError string
-	}{
-		{
-			name: "correct secret",
-			response: func(t testing.TB, expected []byte) []byte {
-				response, err := proto.Marshal(&attestuxv1.CredentialActivationResponse{
-					Secret: bytes.Clone(expected),
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-				return response
-			},
-		},
-		{
-			name:      "empty",
-			response:  func(testing.TB, []byte) []byte { return nil },
-			wantError: "invalid size 0",
-		},
-		{
-			name: "oversized",
-			response: func(testing.TB, []byte) []byte {
-				return make([]byte, attestation.MaxActivationMessageSize+1)
-			},
-			wantError: fmt.Sprintf("invalid size %d", attestation.MaxActivationMessageSize+1),
-		},
-		{
-			name:      "malformed protobuf",
-			response:  func(testing.TB, []byte) []byte { return []byte{0xff} },
-			wantError: "could not be decoded",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			session := newActivationTestSession(t)
-			secret := session.expectedSecret
-			response := test.response(t, secret)
-			report, err := session.CompleteActivationBytes(response)
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED
-			if test.wantError == "" {
-				want = attestuxv1.VerificationStatus_VERIFICATION_STATUS_VERIFIED
-			}
-			if report.Status != want {
-				t.Fatalf("status = %v, want %v: %v", report.Status, want, report)
-			}
-			if test.wantError != "" && !containsMessage(report.Errors, test.wantError) {
-				t.Fatalf("errors = %q, want %q", report.Errors, test.wantError)
-			}
-			requireActivationFinished(t, session, secret)
-			snapshot := session.Report()
-			report.Status = attestuxv1.VerificationStatus_VERIFICATION_STATUS_UNSPECIFIED
-			report.EvidenceSha256[0] ^= 0xff
-			if len(report.Errors) > 0 {
-				report.Errors[0] = "changed by caller"
-			}
-			if len(report.EndorsementKeySha256) > 0 {
-				report.EndorsementKeySha256[0] ^= 0xff
-			}
-			if !proto.Equal(session.Report(), snapshot) {
-				t.Fatal("changing the returned report changed the session")
-			}
-		})
+func TestCompleteEvidenceConsumesMalformedResponses(t *testing.T) {
+	for _, raw := range [][]byte{nil, {0xff}, make([]byte, attestation.MaxEvidenceSize+1)} {
+		session, _, _ := newQuoteTestSession(t)
+		nonce := session.expectedQuoteNonce
+		report, err := session.CompleteEvidence(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(raw)
+		if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED || !bytes.Equal(report.EvidenceSha256, sum[:]) {
+			t.Fatalf("malformed evidence accepted: %v", report)
+		}
+		requireActivationFinished(t, session, nonce)
 	}
 }
 
-func softwareEvidence(t testing.TB) ([]byte, []byte, *endorsementCertificateFixture) {
-	t.Helper()
-	fixture := newEndorsementCertificateFixture(t)
-	evidence, nonce := softwareEvidenceWithFixture(t, fixture, nil)
-	return marshalEvidence(t, evidence), nonce, fixture
-}
-
-// Extend PCR 7 so the quote covers the mutated log. A nil ak gets a fresh key.
+// Build keys and PCRs with PCR 7 extended for the log; quoteResponse signs them later.
+// A nil ak gets a fresh key.
 func softwareEvidenceWithFixture(
 	t testing.TB,
 	fixture *endorsementCertificateFixture,
 	ak *softwareAK,
 	events ...logEvent,
-) (*attestuxv1.AttestationEvidence, []byte) {
+) *attestuxv1.AttestationEvidence {
 	t.Helper()
 	if ak == nil {
 		ak = newSoftwareAK(t)
 	}
-	nonce := bytes.Repeat([]byte{0x22}, 20)
-	selection := allAttestedPCRs()
-	pcr7 := extendedSHA256PCR(events...)
-	composite := sha256.New()
-	for index := range selection.PCRs {
-		if index == 7 {
-			composite.Write(pcr7)
-		} else {
-			composite.Write(make([]byte, sha256.Size))
-		}
-	}
-	evidence := ak.quoteEvidence(t, nonce, selection, composite.Sum(nil))
-	evidence.PcrBanks[0].Pcrs[7].Digest = pcr7
-	evidence.EndorsementKeys = []*attestuxv1.EndorsementKey{fixture.issue(t, 2, nil)}
+	evidence := ak.unquotedEvidence(t)
+	evidence.PcrBanks[0].Pcrs[7].Digest = extendedSHA256PCR(events...)
+	evidence.Keys.EndorsementKeys = []*attestuxv1.EndorsementKey{fixture.issue(t, 2, nil)}
 	evidence.EventLog = cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, events...)
-	return evidence, nonce
+	return evidence
 }
 
 func (fixture *endorsementCertificateFixture) policy() verificationPolicy {
@@ -213,24 +205,6 @@ func (fixture *endorsementCertificateFixture) policy() verificationPolicy {
 		limitation: "test policy limitation",
 		trust:      certificateTrust{roots: fixture.roots},
 	}
-}
-
-func newActivationTestSession(t *testing.T) *VerificationSession {
-	t.Helper()
-	raw, nonce, fixture := softwareEvidence(t)
-	session, err := prepareVerificationWithPolicies(
-		raw,
-		nonce,
-		[]verificationPolicy{fixture.policy()},
-		fixture.now,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if session.ActivationChallenge() == nil {
-		t.Fatalf("software evidence was not challenged: %v", session.Report().Errors)
-	}
-	return session
 }
 
 func TestKeepAttestedPCREventsKeepsOnlyAttestedRegisters(t *testing.T) {
@@ -253,7 +227,7 @@ func TestKeepAttestedPCREventsKeepsOnlyAttestedRegisters(t *testing.T) {
 }
 
 func TestSetPCRReplayedFillsOnlyTheMatchingIndex(t *testing.T) {
-	results := []*attestuxv1.PcrResult{
+	results := []*resultv1.PcrResult{
 		{HashAlgorithm: attestation.TPMAlgSHA256, Pcr: &attestuxv1.Pcr{Index: 5}},
 		{HashAlgorithm: attestation.TPMAlgSHA256, Pcr: &attestuxv1.Pcr{Index: 7}},
 	}
@@ -297,65 +271,35 @@ func newFuzzEndorsementCertificateFixture(t testing.TB) *endorsementCertificateF
 
 func FuzzPrepareVerification(f *testing.F) {
 	fixture := newFuzzEndorsementCertificateFixture(f)
-	evidence, nonce := softwareEvidenceWithFixture(f, fixture, nil)
-	raw := marshalEvidence(f, evidence)
-	policies := []verificationPolicy{fixture.policy()}
-	// The fixed root must keep the seeds accepted under a fresh fixture, or
-	// the corpus silently degrades to rejected inputs.
-	seed, err := prepareVerificationWithPolicies(raw, nonce, []verificationPolicy{newFuzzEndorsementCertificateFixture(f).policy()}, fixture.now)
-	if err != nil || seed.ActivationChallenge() == nil {
-		f.Fatalf("seed was rejected under a fresh fixture: %v", err)
-	}
-	seed.Cancel()
-	f.Add(raw, nonce)
-	measured, nonce := softwareEvidenceWithFixture(f, fixture, nil, logEvent{pcrIndex: 7, eventType: 5, data: []byte("seed measurement")})
-	f.Add(marshalEvidence(f, measured), nonce)
-	f.Add(marshalEvidence(f, attestationtest.MinimallyShapedEvidence()), bytes.Repeat([]byte{2}, 20))
-	f.Add([]byte{0xff}, []byte{2})
-	f.Fuzz(func(t *testing.T, evidence, nonce []byte) {
-		if len(evidence) > 1<<20 {
+	evidence := softwareEvidenceWithFixture(f, fixture, nil)
+	f.Add(marshalHello(f, evidence.Keys))
+	f.Add([]byte{0xff})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, hello []byte) {
+		if len(hello) > 1<<20 {
 			t.Skip()
 		}
-		session, err := prepareVerificationWithPolicies(evidence, nonce, policies, fixture.now)
-		if (err != nil) != (attestation.ValidateChallengeNonce(nonce) != nil) {
-			t.Fatalf("error %v does not follow the nonce validity", err)
-		}
-		if err != nil {
-			return
-		}
+		session := prepareVerificationWithPolicies(hello, []verificationPolicy{fixture.policy()}, fixture.now)
+		defer session.Cancel()
 		report := session.Report()
-		challenge := session.ActivationChallenge()
-		if sum := sha256.Sum256(evidence); !bytes.Equal(report.EvidenceSha256, sum[:]) {
-			t.Fatal("report does not hash the received evidence")
+		requireReportIntegrity(t, report, hello)
+		if (session.ActivationChallenge() != nil) != (len(report.Errors) == 0) {
+			t.Fatal("challenge disagrees with report")
 		}
-		for _, text := range slices.Concat(report.Errors, report.Warnings, report.Limitations) {
-			if len(text) > maxDiagnosticMessageBytes+len("...") || !utf8.ValidString(text) {
-				t.Fatalf("unbounded or invalid diagnostic %q", text)
-			}
+		if len(report.Pcrs) != 0 || describesTrust(report) || report.DeviceId != "" {
+			t.Fatal("discovery made unproven claims")
 		}
-		if (challenge != nil) != (len(report.Errors) == 0) {
-			t.Fatalf("challenge issued = %v with errors %q", challenge != nil, report.Errors)
-		}
-		if challenge == nil {
-			if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED {
-				t.Fatalf("rejected evidence has status %v", report.Status)
-			}
+		if session.ActivationChallenge() == nil {
 			if _, err := CompletionForReport(report); err != nil {
-				t.Fatalf("rejected report cannot complete: %v", err)
+				t.Fatalf("rejected hello cannot produce a completion: %v", err)
 			}
-			return
+		} else if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION ||
+			len(session.expectedQuoteNonce) != sha256.Size {
+			t.Fatalf("invalid pending activation: %v", report)
 		}
-		if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION ||
-			report.DeviceId == "" || len(report.Pcrs) != attestation.AttestedPCRCount ||
-			describesTrust(report) || len(challenge.EndorsementKeySha256) != sha256.Size {
-			t.Fatalf("pending report %v; want an identified device, no trust facts and a full challenge", report)
-		}
-		if _, err := proto.Marshal(report); err != nil {
-			t.Fatalf("pending report does not marshal: %v", err)
-		}
-		secret := session.expectedSecret
+		nonce := session.expectedQuoteNonce
 		session.Cancel()
-		requireActivationFinished(t, session, secret)
+		requireActivationFinished(t, session, nonce)
 	})
 }
 
@@ -437,7 +381,7 @@ func TestSelectEndorsementPolicyTriesEveryConfiguredPolicy(t *testing.T) {
 	}
 }
 
-func TestPrepareVerificationRejectionsKeepDeviceAttribution(t *testing.T) {
+func TestPrepareVerificationRejectsUntrustedKeysWithoutAttribution(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		untrusted  bool
@@ -451,9 +395,16 @@ func TestPrepareVerificationRejectionsKeepDeviceAttribution(t *testing.T) {
 			wantError: "endorsement certificate verification failed",
 		},
 		{
+			name: "trailing AK public data",
+			change: func(_ testing.TB, _ *softwareAK, e *attestuxv1.AttestationEvidence) {
+				e.Keys.AttestationPublic = append(e.Keys.AttestationPublic, 0)
+			},
+			wantError: "parse attestation public key: " + attestation.ErrNonCanonicalAKPublic.Error(),
+		},
+		{
 			name: "forged AK creation signature",
 			change: func(_ testing.TB, _ *softwareAK, e *attestuxv1.AttestationEvidence) {
-				e.AkCreateSignature[len(e.AkCreateSignature)-1] ^= 0xff
+				e.Keys.AkCreateSignature[len(e.Keys.AkCreateSignature)-1] ^= 0xff
 			},
 			wantError: "attestation key is not TPM-created",
 		},
@@ -481,14 +432,16 @@ func TestPrepareVerificationRejectionsKeepDeviceAttribution(t *testing.T) {
 		{
 			name: "creation proof for another key",
 			change: func(t testing.TB, ak *softwareAK, e *attestuxv1.AttestationEvidence) {
-				e.AkCreateAttestation, e.AkCreateSignature = ak.creationProof(t, newSoftwareAK(t).name(t), e.AkCreateData)
+				e.Keys.AkCreateAttestation, e.Keys.AkCreateSignature = ak.creationProof(t, newSoftwareAK(t).name(t), e.Keys.AkCreateData)
 			},
 			wantError: "attestation key is not TPM-created",
 		},
 		{
 			name: "quote presented as the creation proof",
-			change: func(_ testing.TB, _ *softwareAK, e *attestuxv1.AttestationEvidence) {
-				e.AkCreateAttestation, e.AkCreateSignature = e.PcrBanks[0].Quote.Quote, e.PcrBanks[0].Quote.Signature
+			change: func(t testing.TB, ak *softwareAK, e *attestuxv1.AttestationEvidence) {
+				selection := allAttestedPCRs()
+				quote := ak.quoteEvidence(t, nil, selection, zeroPCRComposite(selection)).PcrBanks[0].Quote
+				e.Keys.AkCreateAttestation, e.Keys.AkCreateSignature = quote.Quote, quote.Signature
 			},
 			wantError: "attestation key is not TPM-created",
 		},
@@ -499,25 +452,22 @@ func TestPrepareVerificationRejectionsKeepDeviceAttribution(t *testing.T) {
 			if test.attributes != 0 {
 				ak.public.Attributes = test.attributes
 			}
-			evidence, nonce := softwareEvidenceWithFixture(t, fixture, ak)
+			evidence := softwareEvidenceWithFixture(t, fixture, ak)
 			if test.change != nil {
 				test.change(t, ak, evidence)
 			}
-			raw := marshalEvidence(t, evidence)
+			raw := marshalHello(t, evidence.Keys)
 			policy := fixture.policy()
 			if test.untrusted {
 				policy.trust = certificateTrust{roots: x509.NewCertPool()}
 			}
-			session, err := prepareVerificationWithPolicies(raw, nonce, []verificationPolicy{policy}, fixture.now)
-			if err != nil {
-				t.Fatal(err)
-			}
+			session := prepareVerificationWithPolicies(raw, []verificationPolicy{policy}, fixture.now)
 			report := session.Report()
-			if session.ActivationChallenge() != nil || report.DeviceId == "" || describesTrust(report) ||
-				len(report.Pcrs) != attestation.AttestedPCRCount || len(report.Events) != 0 ||
+			if session.ActivationChallenge() != nil || report.DeviceId != "" || describesTrust(report) ||
+				len(report.Pcrs) != 0 || len(report.Events) != 0 ||
 				!containsMessage(report.Errors, test.wantError) {
 				t.Fatalf(
-					"rejected report: device %q, %d PCRs, %d events, errors %q; want an identified device, no trust facts, no replay, and %q",
+					"rejected report: device %q, %d PCRs, %d events, errors %q; want no device attribution, no trust facts, no replay, and %q",
 					report.DeviceId,
 					len(report.Pcrs),
 					len(report.Events),
@@ -530,11 +480,9 @@ func TestPrepareVerificationRejectionsKeepDeviceAttribution(t *testing.T) {
 }
 
 func TestPrepareVerificationUsesTheNuvotonPolicy(t *testing.T) {
-	raw, nonce, _ := softwareEvidence(t)
-	session, err := PrepareVerification(raw, nonce)
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := newEndorsementCertificateFixture(t)
+	e := softwareEvidenceWithFixture(t, fixture, nil)
+	session := PrepareVerification(marshalHello(t, e.Keys))
 	defer session.Cancel()
 	report := session.Report()
 	// The fixture has fixed dates, so the exact chain error depends on when this runs.
@@ -551,7 +499,7 @@ func TestPrepareVerificationUsesTheNuvotonPolicy(t *testing.T) {
 	}
 }
 
-func TestPrepareVerificationDisclosesAnIncompleteEventLog(t *testing.T) {
+func TestCompleteEvidenceDisclosesAnIncompleteEventLog(t *testing.T) {
 	banks := []attest.HashAlg{attest.HashSHA256}
 	header := cryptoAgileEventLogHeader(t, banks)
 	for _, test := range []struct {
@@ -569,15 +517,10 @@ func TestPrepareVerificationDisclosesAnIncompleteEventLog(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newEndorsementCertificateFixture(t)
-			evidence, nonce := softwareEvidenceWithFixture(t, fixture, nil)
+			session, ak, evidence := newQuoteTestSession(t)
 			evidence.EventLog = test.log
-			raw := marshalEvidence(t, evidence)
-			session, err := prepareVerificationWithPolicies(raw, nonce, []verificationPolicy{fixture.policy()}, fixture.now)
-			if err != nil {
-				t.Fatal(err)
-			}
-			report, err := session.finishActivation(bytes.Clone(session.expectedSecret), "")
+			raw := quoteResponse(t, ak, evidence, session.expectedQuoteNonce)
+			report, err := session.CompleteEvidence(raw)
 			if err != nil {
 				t.Fatalf("%v: %q", err, session.Report().Errors)
 			}
@@ -599,26 +542,55 @@ func TestPrepareVerificationDisclosesAnIncompleteEventLog(t *testing.T) {
 }
 
 func TestPrepareVerificationLifecycleInSoftware(t *testing.T) {
-	session := newActivationTestSession(t)
-	challenge := session.ActivationChallenge()
-	report := session.Report()
-	if len(report.Errors) != 0 ||
-		report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION ||
-		describesTrust(report) || !containsMessage(report.Limitations, "descriptive metadata") ||
-		len(report.Pcrs) != attestation.AttestedPCRCount || len(report.Warnings) != 0 {
-		t.Fatalf("unexpected pending report: %v", report)
-	}
-	verified, err := session.finishActivation(bytes.Clone(session.expectedSecret), "")
+	session, ak, evidence := newQuoteTestSession(t)
+	wantDeviceID, err := attestation.DeviceID(evidence.Keys.AttestationPublic)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_VERIFIED ||
-		verified.TrustPolicy != attestuxv1.TrustPolicy_TRUST_POLICY_NUVOTON ||
-		!bytes.Equal(verified.EndorsementKeySha256, challenge.EndorsementKeySha256) ||
-		!containsMessage(verified.Limitations, "test policy limitation") {
-		t.Fatalf("verified report %v; want the policy, its limitation and the activated EK", verified)
+	challenge := session.ActivationChallenge()
+	pending := session.Report()
+	if pending.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION || pending.DeviceId != "" || len(pending.Pcrs) != 0 || describesTrust(pending) {
+		t.Fatalf("discovery makes unproven claims: %v", pending)
+	}
+	nonce := session.expectedQuoteNonce
+	raw := quoteResponse(t, ak, evidence, nonce)
+	verified, err := session.CompleteEvidence(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_VERIFIED || verified.DeviceId != wantDeviceID || !bytes.Equal(verified.EndorsementKeySha256, challenge.EndorsementKeySha256) || !containsMessage(verified.Limitations, "test policy limitation") {
+		t.Fatalf("unexpected verified report: %v", verified)
 	}
 	if _, err := CompletionForReport(verified); err != nil {
-		t.Fatalf("verified report cannot complete: %v", err)
+		t.Fatal(err)
 	}
+	snapshot := session.Report()
+	verified.Pcrs[0].Pcr.Digest[0] ^= 0xff
+	if !proto.Equal(snapshot, session.Report()) {
+		t.Fatal("caller changed session report")
+	}
+	requireActivationFinished(t, session, nonce)
+}
+
+func newQuoteTestSession(t *testing.T) (*VerificationSession, *softwareAK, *attestuxv1.AttestationEvidence) {
+	t.Helper()
+	fixture := newEndorsementCertificateFixture(t)
+	ak := newSoftwareAK(t)
+	evidence := softwareEvidenceWithFixture(t, fixture, ak)
+	session := prepareVerificationWithPolicies(marshalHello(t, evidence.Keys), []verificationPolicy{fixture.policy()}, fixture.now)
+	if session.ActivationChallenge() == nil {
+		t.Fatalf("keys were rejected: %v", session.Report())
+	}
+	return session, ak, evidence
+}
+
+func quoteResponse(t testing.TB, ak *softwareAK, evidence *attestuxv1.AttestationEvidence, nonce []byte) []byte {
+	t.Helper()
+	out := proto.Clone(evidence).(*attestuxv1.AttestationEvidence)
+	composite := sha256.New()
+	for _, pcr := range out.PcrBanks[0].Pcrs {
+		composite.Write(pcr.Digest)
+	}
+	out.PcrBanks[0].Quote = ak.quoteEvidence(t, nonce, allAttestedPCRs(), composite.Sum(nil)).PcrBanks[0].Quote
+	return marshalEvidence(t, out)
 }

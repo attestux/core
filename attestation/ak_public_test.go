@@ -3,7 +3,9 @@ package attestation
 import (
 	"bytes"
 	"crypto/elliptic"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -20,7 +22,7 @@ func encodePublic(t *testing.T, public legacytpm2.Public) []byte {
 	return raw
 }
 
-func TestParseCanonicalAKPublicAcceptsOnlySHA256Signers(t *testing.T) {
+func TestDeviceIDAcceptsOnlyCanonicalSHA256Signers(t *testing.T) {
 	generator := elliptic.P256().Params()
 	signer := func(change func(*legacytpm2.Public)) []byte {
 		public := legacytpm2.Public{
@@ -42,32 +44,31 @@ func TestParseCanonicalAKPublicAcceptsOnlySHA256Signers(t *testing.T) {
 		return encodePublic(t, public)
 	}
 	valid := signer(nil)
+	wantID := fmt.Sprintf("%x", sha256.Sum256(valid))
 	for _, test := range []struct {
-		name  string
-		raw   []byte
-		exact bool
-		want  string
+		name string
+		raw  []byte
+		want string
 	}{
-		{"ECDSA P-256 signer", valid, true, ""},
-		{"trailing data", append(bytes.Clone(valid), 0), false, ""},
-		{"SHA-1 name", signer(func(p *legacytpm2.Public) { p.NameAlg = legacytpm2.AlgSHA1 }), false, "TPM Name uses SHA-1"},
-		{"SHA-1 signatures", signer(func(p *legacytpm2.Public) { p.ECCParameters.Sign.Hash = legacytpm2.AlgSHA1 }), false, "signatures use SHA-1"},
-		{"decryption key", signer(func(p *legacytpm2.Public) { p.ECCParameters.Sign = nil }), false, "missing ecc signature scheme"},
+		{"ECDSA P-256 signer", valid, ""},
+		{"trailing data", append(bytes.Clone(valid), 0), ErrNonCanonicalAKPublic.Error()},
+		{"SHA-1 name", signer(func(p *legacytpm2.Public) { p.NameAlg = legacytpm2.AlgSHA1 }), "TPM Name uses SHA-1"},
+		{"SHA-1 signatures", signer(func(p *legacytpm2.Public) { p.ECCParameters.Sign.Hash = legacytpm2.AlgSHA1 }), "signatures use SHA-1"},
+		{"decryption key", signer(func(p *legacytpm2.Public) { p.ECCParameters.Sign = nil }), "missing ecc signature scheme"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ak, canonical, exact, err := ParseCanonicalAKPublic(test.raw)
-			_, idErr := DeviceID(test.raw)
+			id, err := DeviceID(test.raw)
 			if test.want != "" {
-				if ak != nil || err == nil || !strings.Contains(err.Error(), test.want) || idErr == nil {
-					t.Fatalf("parse = %v, %v; device ID error = %v; want %q", ak, err, idErr, test.want)
+				if id != "" || err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("DeviceID = %q, %v; want no identity and error %q", id, err, test.want)
+				}
+				if test.want == ErrNonCanonicalAKPublic.Error() && !errors.Is(err, ErrNonCanonicalAKPublic) {
+					t.Fatalf("error = %v, want ErrNonCanonicalAKPublic", err)
 				}
 				return
 			}
-			if err != nil || ak == nil || exact != test.exact || !bytes.Equal(canonical, valid) {
-				t.Fatalf("parse = %v, exact %v, %v; want exact %v", ak, exact, err, test.exact)
-			}
-			if (test.exact && idErr != nil) || (!test.exact && !errors.Is(idErr, ErrNonCanonicalAKPublic)) {
-				t.Fatalf("device ID error = %v for exact %v", idErr, test.exact)
+			if err != nil || id != wantID {
+				t.Fatalf("DeviceID = %q, %v; want %q", id, err, wantID)
 			}
 		})
 	}

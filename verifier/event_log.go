@@ -8,7 +8,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
 
 	"github.com/google/go-attestation/attest"
 )
@@ -71,8 +71,8 @@ func countExtendingEvents(events []attest.Event, index int) int {
 	return count
 }
 
-func normalizeEvent(e attest.Event, sequence uint32) *attestuxv1.Event {
-	return &attestuxv1.Event{
+func normalizeEvent(e attest.Event, sequence uint32) *resultv1.Event {
+	return &resultv1.Event{
 		Sequence:      sequence,
 		PcrIndex:      uint32(e.Index),
 		EventType:     uint32(e.Type),

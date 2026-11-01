@@ -1,6 +1,6 @@
 package attestation
 
-import attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+import "github.com/attestux/protocol-go/attestux/v1"
 
 // TrustPolicyName is for display. The boolean only says the value is a known policy;
 // trust comes from the roots an operator configures for it.

@@ -1,14 +1,32 @@
 package attestation
 
-import "testing"
+import (
+	"bytes"
+	"crypto/sha256"
+	"testing"
 
-func TestValidateChallengeNonceBounds(t *testing.T) {
-	for size, accepted := range map[int]bool{15: false, 16: true, 32: true, 33: false} {
-		if err := ValidateChallengeNonce(make([]byte, size)); (err == nil) != accepted {
-			t.Errorf("nonce of %d bytes: error = %v, want accepted %v", size, err, accepted)
-		}
+	"google.golang.org/protobuf/proto"
+)
+
+func TestKeyDiscoveryRequestsTheCurrentProtocol(t *testing.T) {
+	request := NewChallenge()
+	if request.ProtocolVersion != ProtocolVersion || len(request.ProtoReflect().GetUnknown()) != 0 {
+		t.Fatal("key discovery contains unexpected fields")
 	}
-	if err := ValidateChallengeNonce(NewChallenge().Nonce); err != nil {
-		t.Fatalf("issued nonce is unusable: %v", err)
+	raw, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, []byte{0x08, 1}) {
+		t.Fatalf("challenge encoding = %x, want field 1 with protocol version 1", raw)
+	}
+}
+
+func TestActivationQuoteNonceHashesTheSecret(t *testing.T) {
+	secret := []byte("activation secret")
+	want := sha256.Sum256(secret)
+	got := ActivationQuoteNonce(secret)
+	if !bytes.Equal(got, want[:]) || bytes.Equal(got, secret) {
+		t.Fatalf("quote nonce = %x, want SHA-256(secret)", got)
 	}
 }

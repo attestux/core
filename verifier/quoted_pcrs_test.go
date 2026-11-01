@@ -12,7 +12,7 @@ import (
 
 	"github.com/attestux/core/attestation"
 	"github.com/attestux/core/attestation/attestationtest"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	legacytpm2 "github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
@@ -110,7 +110,7 @@ func (ak *softwareAK) creationProof(t testing.TB, name legacytpm2.Name, createDa
 	})
 }
 
-func (ak *softwareAK) evidenceForQuote(t testing.TB, quote legacytpm2.AttestationData) *attestuxv1.AttestationEvidence {
+func (ak *softwareAK) unquotedEvidence(t testing.TB) *attestuxv1.AttestationEvidence {
 	t.Helper()
 	createData, err := (&legacytpm2.CreationData{
 		PCRSelection:  legacytpm2.PCRSelection{Hash: legacytpm2.AlgSHA256},
@@ -120,9 +120,16 @@ func (ak *softwareAK) evidenceForQuote(t testing.TB, quote legacytpm2.Attestatio
 		t.Fatal(err)
 	}
 	evidence := attestationtest.MinimallyShapedEvidence()
-	evidence.AttestationPublic = ak.encodedPublic(t)
-	evidence.AkCreateData = createData
-	evidence.AkCreateAttestation, evidence.AkCreateSignature = ak.creationProof(t, ak.name(t), createData)
+	evidence.Keys.AttestationPublic = ak.encodedPublic(t)
+	evidence.Keys.AkCreateData = createData
+	evidence.Keys.AkCreateAttestation, evidence.Keys.AkCreateSignature = ak.creationProof(t, ak.name(t), createData)
+	evidence.PcrBanks[0].Quote = nil
+	return evidence
+}
+
+func (ak *softwareAK) evidenceForQuote(t testing.TB, quote legacytpm2.AttestationData) *attestuxv1.AttestationEvidence {
+	t.Helper()
+	evidence := ak.unquotedEvidence(t)
 	quoteBytes, quoteSignature := ak.sign(t, quote)
 	evidence.PcrBanks[0].Quote = &attestuxv1.Quote{Quote: quoteBytes, Signature: quoteSignature}
 	return evidence
@@ -163,11 +170,9 @@ func allAttestedPCRs() legacytpm2.PCRSelection {
 
 func TestVerifyQuotedPCRsSelectionCoverage(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		selection  legacytpm2.PCRSelection
-		changeAK   func([]byte) []byte
-		identified bool
-		wantError  string
+		name      string
+		selection legacytpm2.PCRSelection
+		wantError string
 	}{
 		{
 			name:      "no SHA-256 PCR",
@@ -179,19 +184,6 @@ func TestVerifyQuotedPCRsSelectionCoverage(t *testing.T) {
 			selection: legacytpm2.PCRSelection{Hash: legacytpm2.AlgSHA256, PCRs: []int{0}},
 			wantError: "was not included in quote",
 		},
-		{
-			name:      "unparsable AK",
-			selection: allAttestedPCRs(),
-			changeAK:  func([]byte) []byte { return []byte{9} },
-			wantError: "parse attestation public key",
-		},
-		{
-			name:       "trailing AK data",
-			selection:  allAttestedPCRs(),
-			changeAK:   func(akPublic []byte) []byte { return append(akPublic, 0) },
-			identified: true,
-			wantError:  "trailing or non-canonical data",
-		},
 		{name: "all attested PCRs", selection: allAttestedPCRs()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -201,27 +193,18 @@ func TestVerifyQuotedPCRsSelectionCoverage(t *testing.T) {
 				[]*attestuxv1.PcrBankEvidence{attestationtest.MakeUnsupportedPCRBank(evidence, attestation.TPMAlgSHA1, 20)},
 				evidence.PcrBanks...,
 			)
-			if test.changeAK != nil {
-				evidence.AttestationPublic = test.changeAK(evidence.AttestationPublic)
-			}
-			deviceID, pcrs, results, err := verifyQuotedPCRs(evidence, nonce)
+			pcrs, results, err := verifyQuotedPCRs(evidence, nonce)
 			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) || (deviceID != "") != test.identified {
-					t.Fatalf("got device %q, error %v; want %q, identified %v", deviceID, err, test.wantError, test.identified)
-				}
-				report, _ := buildQuoteReportAndPCRs(evidence, nonce)
-				if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-					report.DeviceId != deviceID || len(report.Warnings) != 0 || !containsMessage(report.Errors, test.wantError) {
-					t.Fatalf("rejected report = %v; want device %q, no warnings, and error %q", report, deviceID, test.wantError)
+				if err == nil || !strings.Contains(err.Error(), test.wantError) || len(pcrs)+len(results) != 0 {
+					t.Fatalf("got %d PCRs, %d results, error %v; want no PCRs and error %q", len(pcrs), len(results), err, test.wantError)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("rejected a fully covering quote: %v", err)
 			}
-			if deviceID == "" ||
-				len(pcrs) != attestation.AttestedPCRCount || len(results) != attestation.AttestedPCRCount {
-				t.Fatalf("got device %q, %d PCRs and %d results", deviceID, len(pcrs), len(results))
+			if len(pcrs) != attestation.AttestedPCRCount || len(results) != attestation.AttestedPCRCount {
+				t.Fatalf("got %d PCRs and %d results", len(pcrs), len(results))
 			}
 		})
 	}
@@ -292,7 +275,7 @@ func TestVerifyQuotedPCRsRejectsForgedQuotes(t *testing.T) {
 			name: "quote signed by another key",
 			evidence: func(t testing.TB) *attestuxv1.AttestationEvidence {
 				evidence := newSoftwareAK(t).evidenceForQuote(t, quoteOver(expected))
-				evidence.AttestationPublic = newSoftwareAK(t).encodedPublic(t)
+				evidence.Keys.AttestationPublic = newSoftwareAK(t).encodedPublic(t)
 				return evidence
 			},
 			wantError: "invalid quote signature",
@@ -305,9 +288,9 @@ func TestVerifyQuotedPCRsRejectsForgedQuotes(t *testing.T) {
 		{name: "no nonce", evidence: overNonce(nil), wantError: "nonce"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			deviceID, pcrs, _, err := verifyQuotedPCRs(test.evidence(t), expected)
-			if err == nil || !strings.Contains(err.Error(), test.wantError) || deviceID != "" || len(pcrs) != 0 {
-				t.Fatalf("device %q, %d PCRs, error %v; want %q and no attribution", deviceID, len(pcrs), err, test.wantError)
+			pcrs, results, err := verifyQuotedPCRs(test.evidence(t), expected)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) || len(pcrs)+len(results) != 0 {
+				t.Fatalf("%d PCRs, %d results, error %v; want %q and no PCRs", len(pcrs), len(results), err, test.wantError)
 			}
 		})
 	}

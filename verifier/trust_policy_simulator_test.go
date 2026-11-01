@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/attestux/core/verifier/testtrust"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 )
 
 func TestRuntimeVerificationPoliciesAddTheSimulatorRoot(t *testing.T) {

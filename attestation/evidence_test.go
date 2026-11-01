@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/attestux/core/attestation/attestationtest"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -22,7 +22,7 @@ func TestValidateEvidenceChecksShape(t *testing.T) {
 	endorsementKeys := func(e *attestuxv1.AttestationEvidence, count int) []*attestuxv1.EndorsementKey {
 		keys := make([]*attestuxv1.EndorsementKey, count)
 		for i := range keys {
-			keys[i] = e.EndorsementKeys[0]
+			keys[i] = e.Keys.EndorsementKeys[0]
 		}
 		return keys
 	}
@@ -31,17 +31,20 @@ func TestValidateEvidenceChecksShape(t *testing.T) {
 		mutate func(*attestuxv1.AttestationEvidence)
 		want   string
 	}{
+		{"missing keys", func(e *attestuxv1.AttestationEvidence) {
+			e.Keys = nil
+		}, "missing attestation keys"},
 		{"empty attestation public", func(e *attestuxv1.AttestationEvidence) {
-			e.AttestationPublic = nil
+			e.Keys.AttestationPublic = nil
 		}, "invalid attestation public-key size"},
 		{"oversized attestation public", func(e *attestuxv1.AttestationEvidence) {
-			e.AttestationPublic = make([]byte, maxAKPublicSize+1)
+			e.Keys.AttestationPublic = make([]byte, maxAKPublicSize+1)
 		}, "invalid attestation public-key size"},
 		{"empty AK creation data", func(e *attestuxv1.AttestationEvidence) {
-			e.AkCreateData = nil
+			e.Keys.AkCreateData = nil
 		}, "invalid attestation-key creation evidence"},
 		{"oversized AK creation signature", func(e *attestuxv1.AttestationEvidence) {
-			e.AkCreateSignature = make([]byte, maxAKCreationSize+1)
+			e.Keys.AkCreateSignature = make([]byte, maxAKCreationSize+1)
 		}, "invalid attestation-key creation evidence"},
 		{"no PCR banks", func(e *attestuxv1.AttestationEvidence) {
 			e.PcrBanks = nil
@@ -57,7 +60,7 @@ func TestValidateEvidenceChecksShape(t *testing.T) {
 		{"PCR beyond V1 scope", func(e *attestuxv1.AttestationEvidence) {
 			pcrs := e.PcrBanks[0].Pcrs
 			pcrs[len(pcrs)-1].Index = AttestedPCRCount
-		}, fmt.Sprintf("invalid PCR %d", AttestedPCRCount-1)},
+		}, fmt.Sprintf("invalid PCR %d", AttestedPCRCount)},
 		{"15 PCRs", func(e *attestuxv1.AttestationEvidence) {
 			e.PcrBanks[0].Pcrs = sha256PCRs(15)
 		}, "requires exactly 16 SHA-256 PCRs"},
@@ -65,13 +68,13 @@ func TestValidateEvidenceChecksShape(t *testing.T) {
 			e.PcrBanks[0].Pcrs = sha256PCRs(17)
 		}, "requires exactly 16 SHA-256 PCRs"},
 		{"no endorsement keys", func(e *attestuxv1.AttestationEvidence) {
-			e.EndorsementKeys = nil
+			e.Keys.EndorsementKeys = nil
 		}, "invalid endorsement-key count 0"},
 		{"maximum endorsement keys", func(e *attestuxv1.AttestationEvidence) {
-			e.EndorsementKeys = endorsementKeys(e, MaxEKCount)
+			e.Keys.EndorsementKeys = endorsementKeys(e, MaxEKCount)
 		}, ""},
 		{"too many endorsement keys", func(e *attestuxv1.AttestationEvidence) {
-			e.EndorsementKeys = endorsementKeys(e, MaxEKCount+1)
+			e.Keys.EndorsementKeys = endorsementKeys(e, MaxEKCount+1)
 		}, fmt.Sprintf("invalid endorsement-key count %d", MaxEKCount+1)},
 		{"additional unsupported bank", func(e *attestuxv1.AttestationEvidence) {
 			e.PcrBanks = append(e.PcrBanks, attestationtest.MakeUnsupportedPCRBank(e, 0x000d, 64))

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 )
 
 type endorsementCertificateFixture struct {
@@ -135,7 +135,6 @@ func TestValidateEndorsementsWithTrustThroughIntermediate(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := &attestuxv1.EndorsementKey{
-		PublicKey:   bytes.Clone(fixture.publicDER),
 		Certificate: leafDER,
 	}
 	if _, err := validateEndorsementsWithTrust(
@@ -166,19 +165,9 @@ func TestValidateEndorsementsWithTrustRejectsInvalidCertificates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrongPublic, err := x509.MarshalPKIXPublicKey(&wrongKey.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	tests := []struct {
 		name            string
-		roots           *x509.CertPool
-		now             time.Time
 		changeTemplate  func(*x509.Certificate)
 		changeCandidate func(*attestuxv1.EndorsementKey)
 		public          crypto.PublicKey
@@ -217,34 +206,6 @@ func TestValidateEndorsementsWithTrustRejectsInvalidCertificates(t *testing.T) {
 				template.UnknownExtKeyUsage = nil
 			},
 			wantError: "lacks EK credential purpose",
-		},
-		{
-			name: "wrong public key",
-			changeCandidate: func(candidate *attestuxv1.EndorsementKey) {
-				candidate.PublicKey = wrongPublic
-			},
-			wantError: "does not match the TPM EK",
-		},
-		{
-			name: "public key with trailing data",
-			changeCandidate: func(candidate *attestuxv1.EndorsementKey) {
-				candidate.PublicKey = append(candidate.PublicKey, 0)
-			},
-			wantError: "does not match the TPM EK",
-		},
-		{
-			name: "empty public key",
-			changeCandidate: func(candidate *attestuxv1.EndorsementKey) {
-				candidate.PublicKey = nil
-			},
-			wantError: "invalid endorsement public-key size",
-		},
-		{
-			name: "oversized public key",
-			changeCandidate: func(candidate *attestuxv1.EndorsementKey) {
-				candidate.PublicKey = make([]byte, maxEKPublicSize+1)
-			},
-			wantError: "invalid endorsement public-key size",
 		},
 		{
 			name: "empty certificate",
@@ -331,18 +292,10 @@ func TestValidateEndorsementsWithTrustRejectsInvalidCertificates(t *testing.T) {
 			if test.changeCandidate != nil {
 				test.changeCandidate(candidate)
 			}
-			roots := test.roots
-			if roots == nil {
-				roots = fixture.roots
-			}
-			now := test.now
-			if now.IsZero() {
-				now = fixture.now
-			}
 			_, err := validateEndorsementsWithTrust(
 				[]*attestuxv1.EndorsementKey{candidate},
-				certificateTrust{roots: roots},
-				now,
+				certificateTrust{roots: fixture.roots},
+				fixture.now,
 			)
 			if err == nil {
 				t.Fatal("accepted invalid endorsement certificate")
@@ -472,12 +425,7 @@ func (fixture *endorsementCertificateFixture) issueFor(
 	if err != nil {
 		t.Fatal(err)
 	}
-	publicDER, err := x509.MarshalPKIXPublicKey(public)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return &attestuxv1.EndorsementKey{
-		PublicKey:   publicDER,
 		Certificate: certificateDER,
 	}
 }

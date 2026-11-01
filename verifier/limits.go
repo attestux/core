@@ -3,7 +3,6 @@ package verifier
 const (
 	MaxReportSize        = 16 << 20
 	MaxReceiptSize       = 64 << 10
-	maxEKPublicSize      = 4 << 10
 	maxEKCertificateSize = 64 << 10
 	maxEventCount        = 100_000
 

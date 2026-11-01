@@ -10,7 +10,8 @@ import (
 	"testing"
 
 	"github.com/attestux/core/attestation"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"github.com/google/go-attestation/attest"
 	"google.golang.org/protobuf/proto"
@@ -43,7 +44,7 @@ func TestReplayEventLogSkipsMissingDigests(t *testing.T) {
 			if len(replay.events) != 1 || len(replay.events[0].Digests) != 1 ||
 				replay.events[0].Digests[0].HashAlgorithm != attestation.TPMAlgSHA1 ||
 				!bytes.Equal(replay.events[0].Digests[0].Digest, digest) ||
-				replay.events[0].Digests[0].State != attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED {
+				replay.events[0].Digests[0].State != resultv1.ReplayState_REPLAY_STATE_UNVERIFIED {
 				t.Fatalf("normalized digests = %+v, want the original unverified SHA-1 digest only", replay.events)
 			}
 		})
@@ -117,14 +118,14 @@ func TestReplayEventLogClassifiesDigestsPerPCR(t *testing.T) {
 	if len(replay.warnings) != 1 || !strings.Contains(replay.warnings[0], "PCR 8") {
 		t.Fatalf("warnings = %q, want one PCR 8 replay failure", replay.warnings)
 	}
+
 	if len(replay.events) != 3 {
 		t.Fatalf("normalized %d events, want 3", len(replay.events))
 	}
-
-	wantStates := []attestuxv1.VerificationState{
-		attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED,
-		attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED,
-		attestuxv1.VerificationState_VERIFICATION_STATE_FAILED,
+	wantStates := []resultv1.ReplayState{
+		resultv1.ReplayState_REPLAY_STATE_VERIFIED,
+		resultv1.ReplayState_REPLAY_STATE_VERIFIED,
+		resultv1.ReplayState_REPLAY_STATE_FAILED,
 	}
 	source := append(extended, unexplained)
 	for i, event := range replay.events {
@@ -136,7 +137,7 @@ func TestReplayEventLogClassifiesDigestsPerPCR(t *testing.T) {
 			t.Fatalf("event %d carries %d digests, want %d", i, len(event.Digests), len(banks))
 		}
 		for _, digest := range event.Digests {
-			want := attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED
+			want := resultv1.ReplayState_REPLAY_STATE_UNVERIFIED
 			if digest.HashAlgorithm == attestation.TPMAlgSHA256 {
 				want = wantStates[i]
 			}
@@ -215,7 +216,7 @@ func TestReplayEventLogWarnsAboutQuirkAssistedReplay(t *testing.T) {
 		t.Fatalf("normalized %d events, want only the logged one", len(replay.events))
 	}
 	for _, digest := range replay.events[0].Digests {
-		if digest.State != attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED {
+		if digest.State != resultv1.ReplayState_REPLAY_STATE_VERIFIED {
 			t.Fatalf("logged event digest state = %v, want verified", digest.State)
 		}
 	}
@@ -308,7 +309,7 @@ func TestReplayEventLogProductionBudgetFitsReport(t *testing.T) {
 		pcrResults[7].ReplayedEventCount != eventCount {
 		t.Fatalf("complete event log was not replayed: %+v", pcrResults[7])
 	}
-	normalized := &attestuxv1.VerificationReport{Events: replay.events}
+	normalized := &resultv1.VerificationReport{Events: replay.events}
 	if size := proto.Size(normalized); size < maxNormalizedEventBytes-(2<<20) ||
 		size > maxNormalizedEventBytes {
 		t.Fatalf(
@@ -317,7 +318,7 @@ func TestReplayEventLogProductionBudgetFitsReport(t *testing.T) {
 			maxNormalizedEventBytes,
 		)
 	}
-	report := &attestuxv1.VerificationReport{
+	report := &resultv1.VerificationReport{
 		DeviceId:           strings.Repeat("a", 64),
 		Pcrs:               pcrResults,
 		Events:             replay.events,
@@ -438,40 +439,34 @@ func TestReplayEventLogReportsInvalidPCRIndices(t *testing.T) {
 	}
 }
 
-func TestClassifyEventVerifiesOnlyExtendingEntries(t *testing.T) {
-	extending := attest.Event{Index: 7, Type: 5, Data: []byte("boot"), Digest: []byte{0xab}}
-	noAction := attest.Event{Index: 7, Type: eventTypeNoAction, Data: []byte("Spec ID Event03")}
-	replay := pcrReplay{7: attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED}
-
-	if got := replay.classifyEvent(attestation.TPMAlgSHA256, extending); got !=
-		attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED {
-		t.Fatalf("extending entry = %v, want verified", got)
-	}
-	if got := replay.classifyEvent(attestation.TPMAlgSHA256, noAction); got !=
-		attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED {
-		t.Fatalf("EV_NO_ACTION entry = %v, want unverified", got)
-	}
-}
-
-func TestClassifyEventReportsFailedAndUnattestedRegisters(t *testing.T) {
-	failedEvent := attest.Event{Index: 5, Type: 1, Digest: []byte{0x01}}
-	unknownEvent := attest.Event{Index: 9, Type: 1, Digest: []byte{0x02}}
-	replay := pcrReplay{5: attestuxv1.VerificationState_VERIFICATION_STATE_FAILED}
-
-	if got := replay.classifyEvent(attestation.TPMAlgSHA256, failedEvent); got !=
-		attestuxv1.VerificationState_VERIFICATION_STATE_FAILED {
-		t.Fatalf("failed register = %v, want failed", got)
-	}
-	if got := replay.classifyEvent(attestation.TPMAlgSHA256, unknownEvent); got !=
-		attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED {
-		t.Fatalf("unreplayed register = %v, want unverified", got)
-	}
-
-	verified := attest.Event{Index: 7, Type: 1, Digest: []byte{0x03}}
-	replay[7] = attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED
-	if got := replay.classifyEvent(attestation.TPMAlgSHA384, verified); got !=
-		attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED {
-		t.Fatalf("SHA-384 digest = %v, want unverified", got)
+func TestClassifyEvent(t *testing.T) {
+	const (
+		verified   = resultv1.ReplayState_REPLAY_STATE_VERIFIED
+		failed     = resultv1.ReplayState_REPLAY_STATE_FAILED
+		unverified = resultv1.ReplayState_REPLAY_STATE_UNVERIFIED
+	)
+	for _, test := range []struct {
+		name      string
+		state     resultv1.ReplayState
+		algorithm uint32
+		index     int
+		eventType attest.EventType
+		want      resultv1.ReplayState
+	}{
+		{"verified PCR", verified, attestation.TPMAlgSHA256, 7, 5, verified},
+		{"failed PCR", failed, attestation.TPMAlgSHA256, 7, 1, failed},
+		{"unattested PCR", failed, attestation.TPMAlgSHA256, 9, 1, unverified},
+		{"unsupported hash", verified, attestation.TPMAlgSHA384, 7, 1, unverified},
+		{"EV_NO_ACTION at verified PCR", verified, attestation.TPMAlgSHA256, 7, eventTypeNoAction, unverified},
+		{"EV_NO_ACTION at failed PCR", failed, attestation.TPMAlgSHA256, 7, eventTypeNoAction, unverified},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			replay := pcrReplay{7: test.state}
+			event := attest.Event{Index: test.index, Type: test.eventType, Digest: []byte{1}}
+			if got := replay.classifyEvent(test.algorithm, event); got != test.want {
+				t.Fatalf("classifyEvent = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -495,7 +490,7 @@ func FuzzReplayEventLog(f *testing.F) {
 				t.Fatalf("normalized an event for unattested PCR %d", event.PcrIndex)
 			}
 		}
-		normalized := &attestuxv1.VerificationReport{Events: replay.events}
+		normalized := &resultv1.VerificationReport{Events: replay.events}
 		if size := proto.Size(normalized); size > maxNormalizedEventBytes {
 			t.Fatalf("normalized %d bytes, budget is %d", size, maxNormalizedEventBytes)
 		}

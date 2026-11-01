@@ -11,23 +11,24 @@ import (
 
 	"github.com/attestux/core/attestation"
 	"github.com/attestux/core/attestation/attestationtest"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"google.golang.org/protobuf/proto"
 )
 
 type fakeVerificationSession struct {
 	canceled            int
-	report              *attestuxv1.VerificationReport
+	report              *resultv1.VerificationReport
 	activationChallenge *attestuxv1.CredentialActivationChallenge
-	completeReport      *attestuxv1.VerificationReport
+	completeReport      *resultv1.VerificationReport
 	completeErr         error
-	activationResponses [][]byte
+	evidenceInputs      [][]byte
 }
 
-func (s *fakeVerificationSession) Report() *attestuxv1.VerificationReport {
+func (s *fakeVerificationSession) Report() *resultv1.VerificationReport {
 	if s.report == nil {
-		return &attestuxv1.VerificationReport{}
+		return &resultv1.VerificationReport{}
 	}
 	return s.report
 }
@@ -36,12 +37,16 @@ func (s *fakeVerificationSession) ActivationChallenge() *attestuxv1.CredentialAc
 	return s.activationChallenge
 }
 
-func (s *fakeVerificationSession) CompleteActivationBytes(response []byte) (*attestuxv1.VerificationReport, error) {
-	s.activationResponses = append(s.activationResponses, bytes.Clone(response))
+func (s *fakeVerificationSession) CompleteEvidence(evidence []byte) (*resultv1.VerificationReport, error) {
+	s.evidenceInputs = append(s.evidenceInputs, bytes.Clone(evidence))
 	return s.completeReport, s.completeErr
 }
 
-func (s *fakeVerificationSession) RejectActivation() (*attestuxv1.VerificationReport, error) {
+func (s *fakeVerificationSession) RejectActivation() (*resultv1.VerificationReport, error) {
+	return s.completeReport, s.completeErr
+}
+
+func (s *fakeVerificationSession) RejectEvidence() (*resultv1.VerificationReport, error) {
 	return s.completeReport, s.completeErr
 }
 
@@ -51,10 +56,6 @@ func (s *fakeVerificationSession) Cancel() {
 
 func pendingFakeSession() *fakeVerificationSession {
 	return &fakeVerificationSession{
-		report: &attestuxv1.VerificationReport{
-			Status:         attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION,
-			EvidenceSha256: make([]byte, sha256.Size),
-		},
 		activationChallenge: &attestuxv1.CredentialActivationChallenge{},
 	}
 }
@@ -67,44 +68,31 @@ func challengedVerifier(t *testing.T, verifier *Verifier) *Verifier {
 	return verifier
 }
 
-func decodePreparation(t *testing.T, raw []byte) *attestuxv1.VerificationPreparation {
+func decodePreparation(t *testing.T, raw []byte) *resultv1.VerificationPreparation {
 	t.Helper()
-	var preparation attestuxv1.VerificationPreparation
+	var preparation resultv1.VerificationPreparation
 	if err := proto.Unmarshal(raw, &preparation); err != nil {
 		t.Fatal(err)
 	}
 	return &preparation
 }
 
-func TestIssueChallengeCreatesOneFreshNonce(t *testing.T) {
+func TestIssueChallengeStartsKeyDiscoveryOnce(t *testing.T) {
 	verifier := NewVerifier()
 	defer verifier.Close()
 	raw, err := verifier.IssueChallenge()
 	if err != nil {
 		t.Fatal(err)
 	}
-	var challenge attestuxv1.AttestationChallenge
-	if err := proto.Unmarshal(raw, &challenge); err != nil {
+	var request attestuxv1.AttestationChallenge
+	if err := proto.Unmarshal(raw, &request); err != nil {
 		t.Fatal(err)
 	}
-	if len(challenge.Nonce) != 32 {
-		t.Fatalf("issued nonce length = %d, want 32", len(challenge.Nonce))
-	}
-	if err := attestation.ValidateChallengeNonce(challenge.Nonce); err != nil {
-		t.Fatalf("issued nonce is unusable: %v", err)
+	if request.ProtocolVersion != attestation.ProtocolVersion || len(request.ProtoReflect().GetUnknown()) != 0 {
+		t.Fatalf("invalid key discovery: %v", &request)
 	}
 	if _, err := verifier.IssueChallenge(); err == nil {
-		t.Fatal("verifier issued a second challenge")
-	}
-
-	other := NewVerifier()
-	defer other.Close()
-	second, err := other.IssueChallenge()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Equal(raw, second) {
-		t.Fatal("two verifiers issued the same challenge")
+		t.Fatal("issued a second request")
 	}
 }
 
@@ -112,40 +100,39 @@ func TestPrepareVerificationRequiresAnIssuedChallenge(t *testing.T) {
 	verifier := NewVerifier()
 	defer verifier.Close()
 	if _, err := verifier.PrepareVerification([]byte{0xff}); err == nil {
-		t.Fatal("verifier prepared evidence without issuing a challenge")
+		t.Fatal("verifier prepared a hello without issuing a challenge")
 	}
 }
 
-func TestMalformedEvidenceProducesRetainableRejectedReport(t *testing.T) {
+func TestMalformedHelloProducesRetainableRejectedReport(t *testing.T) {
 	verifier := challengedVerifier(t, NewVerifier())
 	defer verifier.Close()
-	evidence := []byte{0xff}
-	raw, err := verifier.PrepareVerification(evidence)
+	hello := []byte{0xff}
+	raw, err := verifier.PrepareVerification(hello)
 	if err != nil {
 		t.Fatal(err)
 	}
 	preparation := decodePreparation(t, raw)
 	completion := preparation.GetCompletion()
-	if completion == nil || preparation.GetPending() != nil {
+	if completion == nil || preparation.GetActivationChallenge() != nil {
 		t.Fatalf("unexpected terminal preparation: %v", preparation)
 	}
-	sum := sha256.Sum256(evidence)
+	sum := sha256.Sum256(hello)
 	report := completion.Report
 	receipt := completion.Receipt
 	if report == nil ||
 		report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
 		!bytes.Equal(report.EvidenceSha256, sum[:]) ||
 		len(report.Errors) != 1 ||
-		!strings.Contains(report.Errors[0], "malformed evidence") {
-		t.Fatalf("unexpected malformed-evidence report: %v", report)
+		!strings.Contains(report.Errors[0], "malformed attestation hello") {
+		t.Fatalf("unexpected malformed-hello report: %v", report)
 	}
 	if receipt == nil ||
 		receipt.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-		!bytes.Equal(receipt.EvidenceSha256, sum[:]) ||
 		!slices.Equal(receipt.Errors, report.Errors) {
-		t.Fatalf("unexpected malformed-evidence receipt: %v", receipt)
+		t.Fatalf("unexpected malformed-hello receipt: %v", receipt)
 	}
-	if _, err := verifier.PrepareVerification(evidence); err == nil {
+	if _, err := verifier.PrepareVerification(hello); err == nil {
 		t.Fatal("single-use verifier accepted a second preparation")
 	}
 }
@@ -161,13 +148,9 @@ func TestEncodePreparationReturnsThePendingChallenge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending := decodePreparation(t, raw).GetPending()
-	if pending == nil || pending.ActivationChallenge == nil ||
-		pending.Report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION {
-		t.Fatalf("unexpected preparation: %v", pending)
-	}
-	if !proto.Equal(pending.ActivationChallenge, session.activationChallenge) {
-		t.Fatalf("activation challenge = %v, want %v", pending.ActivationChallenge, session.activationChallenge)
+	challenge := decodePreparation(t, raw).GetActivationChallenge()
+	if !proto.Equal(challenge, session.activationChallenge) {
+		t.Fatalf("unexpected preparation: %v", challenge)
 	}
 	if session.canceled != 0 {
 		t.Fatal("pending session was cancelled before activation")
@@ -208,9 +191,11 @@ func TestEncodePreparationCancelsSessionsThatCannotBeActivated(t *testing.T) {
 
 func TestEncodePreparationCancelsWhenTheChallengeCannotBeEncoded(t *testing.T) {
 	session := pendingFakeSession()
-	session.activationChallenge.Credential = make([]byte, attestation.MaxActivationMessageSize+1)
-	if raw, err := encodePreparationOrCancel(session); raw != nil || err == nil {
-		t.Fatalf("encodePreparationOrCancel = %x, %v; want an encoding failure", raw, err)
+	// Each field fits on its own; the combined encoding exceeds the message limit.
+	session.activationChallenge.Credential = make([]byte, attestation.MaxControlMessageSize)
+	session.activationChallenge.EncryptedSecret = session.activationChallenge.Credential
+	if raw, err := encodePreparationOrCancel(session); raw != nil || err == nil || !strings.Contains(err.Error(), "activation challenge exceeds local limits") {
+		t.Fatalf("encodePreparationOrCancel = %x, %v; want the activation challenge limit", raw, err)
 	}
 	if session.canceled != 1 {
 		t.Fatalf("cancel count = %d, want 1", session.canceled)
@@ -218,42 +203,49 @@ func TestEncodePreparationCancelsWhenTheChallengeCannotBeEncoded(t *testing.T) {
 }
 
 func TestCompletionEncodesTheSessionReport(t *testing.T) {
-	response, err := proto.Marshal(&attestuxv1.CredentialActivationResponse{
-		Secret: bytes.Repeat([]byte{0xa5}, 32),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	evidence := []byte{1, 2, 3}
 	for _, test := range []struct {
 		name     string
 		complete func(*Verifier) ([]byte, error)
 		calls    int
 	}{
-		{"complete", func(v *Verifier) ([]byte, error) { return v.CompleteActivation(response) }, 1},
-		{"reject", (*Verifier).RejectActivation, 0},
+		{"complete", func(v *Verifier) ([]byte, error) { return v.CompleteEvidence(evidence) }, 1},
+		{"reject activation", (*Verifier).RejectActivation, 0},
+		{"reject evidence", (*Verifier).RejectEvidence, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			verifier := NewVerifier()
 			defer verifier.Close()
 			session := &fakeVerificationSession{completeReport: attestationtest.FailedReport()}
+			report := proto.Clone(session.completeReport).(*resultv1.VerificationReport)
 			verifier.session = session
 			raw, err := test.complete(verifier)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(session.activationResponses) != test.calls {
-				t.Fatalf("activation calls = %d, want %d", len(session.activationResponses), test.calls)
+			if len(session.evidenceInputs) != test.calls {
+				t.Fatalf("evidence completion calls = %d, want %d", len(session.evidenceInputs), test.calls)
 			}
-			if test.calls != 0 && !bytes.Equal(session.activationResponses[0], response) {
-				t.Fatalf("activation response = %x, want %x", session.activationResponses[0], response)
+			if test.calls != 0 && !bytes.Equal(session.evidenceInputs[0], evidence) {
+				t.Fatalf("evidence = %x, want %x", session.evidenceInputs[0], evidence)
 			}
-			var completion attestuxv1.VerificationCompletion
+			var completion resultv1.VerificationCompletion
 			if err := proto.Unmarshal(raw, &completion); err != nil {
 				t.Fatal(err)
 			}
-			if completion.Report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-				completion.Receipt.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED {
-				t.Fatalf("unexpected completion: %v", &completion)
+			want := &resultv1.VerificationCompletion{
+				Report: report,
+				Receipt: &attestuxv1.VerificationReceipt{
+					Errors:      report.Errors,
+					TrustPolicy: report.TrustPolicy,
+					Status:      report.Status,
+				},
+			}
+			if !proto.Equal(&completion, want) {
+				t.Fatalf("completion = %v, want %v", &completion, want)
+			}
+			if len(raw) > maxCompletionBytes {
+				t.Fatalf("encoded completion size %d exceeds its budget", len(raw))
 			}
 		})
 	}
@@ -262,14 +254,14 @@ func TestCompletionEncodesTheSessionReport(t *testing.T) {
 func TestCompletionRequiresAUsableSession(t *testing.T) {
 	verifier := NewVerifier()
 	defer verifier.Close()
-	if _, err := verifier.CompleteActivation([]byte{1}); err == nil {
+	if _, err := verifier.CompleteEvidence([]byte{1}); err == nil {
 		t.Fatal("completed without a session")
 	}
-	verifier.session = &fakeVerificationSession{completeErr: errors.New("secret mismatch")}
+	verifier.session = &fakeVerificationSession{completeErr: errors.New("nonce mismatch")}
 	if _, err := verifier.RejectActivation(); err == nil {
 		t.Fatal("session error was ignored")
 	}
-	verifier.session = &fakeVerificationSession{completeReport: &attestuxv1.VerificationReport{}}
+	verifier.session = &fakeVerificationSession{completeReport: &resultv1.VerificationReport{}}
 	if raw, err := verifier.RejectActivation(); err == nil || raw != nil {
 		t.Fatalf("completion = %x, %v; want a nonterminal report refused", raw, err)
 	}
@@ -288,10 +280,10 @@ func TestCloseCancelsTheSessionAndRejectsCalls(t *testing.T) {
 		t.Fatal("closed verifier issued a challenge")
 	}
 	if _, err := verifier.PrepareVerification([]byte{0xff}); err == nil {
-		t.Fatal("closed verifier prepared evidence")
+		t.Fatal("closed verifier prepared a hello")
 	}
-	if _, err := verifier.CompleteActivation([]byte{1}); err == nil {
-		t.Fatal("closed verifier completed an activation")
+	if _, err := verifier.CompleteEvidence([]byte{1}); err == nil {
+		t.Fatal("closed verifier completed evidence verification")
 	}
 }
 
@@ -308,7 +300,7 @@ func TestVerifierSerializesConcurrentCalls(t *testing.T) {
 			<-start
 			switch caller % 4 {
 			case 0:
-				verifier.CompleteActivation([]byte{1})
+				verifier.CompleteEvidence([]byte{1})
 			case 1:
 				verifier.RejectActivation()
 			case 2:

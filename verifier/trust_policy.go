@@ -5,7 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 )
 
 const SimulatorLimitation = "Development test only: the EK certificate chains to the public AttesTux simulator test CA and does not prove genuine TPM hardware."

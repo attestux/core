@@ -5,7 +5,8 @@ package attestationtest
 import (
 	"crypto/sha256"
 
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -25,14 +26,15 @@ func MakeUnsupportedPCRBank(
 
 func MinimallyShapedEvidence() *attestuxv1.AttestationEvidence {
 	evidence := &attestuxv1.AttestationEvidence{
-		AttestationPublic:   []byte{1},
-		AkCreateData:        []byte{1},
-		AkCreateAttestation: []byte{1},
-		AkCreateSignature:   []byte{1},
-		EndorsementKeys: []*attestuxv1.EndorsementKey{{
-			PublicKey:   []byte{1},
-			Certificate: []byte{1},
-		}},
+		Keys: &attestuxv1.AttestationKeys{
+			AttestationPublic:   []byte{1},
+			AkCreateData:        []byte{1},
+			AkCreateAttestation: []byte{1},
+			AkCreateSignature:   []byte{1},
+			EndorsementKeys: []*attestuxv1.EndorsementKey{{
+				Certificate: []byte{1},
+			}},
+		},
 		PcrBanks: []*attestuxv1.PcrBankEvidence{{
 			HashAlgorithm: 0x000b,
 			Quote: &attestuxv1.Quote{
@@ -52,8 +54,8 @@ func MinimallyShapedEvidence() *attestuxv1.AttestationEvidence {
 	return evidence
 }
 
-func FailedReport() *attestuxv1.VerificationReport {
-	return &attestuxv1.VerificationReport{
+func FailedReport() *resultv1.VerificationReport {
+	return &resultv1.VerificationReport{
 		DeviceId:       "device",
 		Status:         attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED,
 		EvidenceSha256: make([]byte, sha256.Size),

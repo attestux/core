@@ -18,47 +18,35 @@ var ErrNonCanonicalAKPublic = errors.New(
 
 // DeviceID hashes the canonical TPM public area. V1 requires SHA-256 Names and signatures.
 func DeviceID(akPublic []byte) (string, error) {
-	_, canonical, exactEncoding, err := ParseCanonicalAKPublic(akPublic)
+	public, err := legacytpm2.DecodePublic(akPublic)
 	if err != nil {
 		return "", err
 	}
-	if !exactEncoding {
-		return "", ErrNonCanonicalAKPublic
-	}
-	return DeriveDeviceID(canonical), nil
-}
-
-func DeriveDeviceID(canonicalAKPublic []byte) string {
-	sum := sha256.Sum256(canonicalAKPublic)
-	return hex.EncodeToString(sum[:])
-}
-
-func ParseCanonicalAKPublic(raw []byte) (*attest.AKPublic, []byte, bool, error) {
-	public, err := legacytpm2.DecodePublic(raw)
-	if err != nil {
-		return nil, nil, false, err
-	}
 	canonical, err := public.Encode()
 	if err != nil {
-		return nil, nil, false, fmt.Errorf("encode canonical TPM public area: %w", err)
+		return "", fmt.Errorf("encode canonical TPM public area: %w", err)
 	}
 	ak, err := attest.ParseAKPublic(canonical)
 	if err != nil {
-		return nil, nil, false, err
+		return "", err
 	}
 	if public.NameAlg != legacytpm2.AlgSHA256 {
-		return nil, nil, false, fmt.Errorf(
+		return "", fmt.Errorf(
 			"attestation key TPM Name uses %s; SHA-256 is required",
 			HashAlgorithmName(uint32(public.NameAlg)),
 		)
 	}
 	if ak.Hash != crypto.SHA256 {
-		return nil, nil, false, fmt.Errorf(
+		return "", fmt.Errorf(
 			"attestation key signatures use %s; SHA-256 is required",
 			ak.Hash,
 		)
 	}
-	return ak, canonical, bytes.Equal(raw, canonical), nil
+	if !bytes.Equal(akPublic, canonical) {
+		return "", ErrNonCanonicalAKPublic
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // RequireSHA256SignatureEncoding checks the encoding only. The caller verifies the signature.
