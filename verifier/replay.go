@@ -5,14 +5,14 @@ import (
 	"slices"
 
 	"github.com/attestux/core/attestation"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
 
 	"github.com/google/go-attestation/attest"
 	"google.golang.org/protobuf/proto"
 )
 
 type eventLogReplay struct {
-	events            []*attestuxv1.Event
+	events            []*resultv1.Event
 	warnings          []string
 	incomplete        bool
 	omittedEventCount uint32
@@ -21,7 +21,7 @@ type eventLogReplay struct {
 func replayEventLog(
 	raw []byte,
 	pcrs []attest.PCR,
-	pcrResults []*attestuxv1.PcrResult,
+	pcrResults []*resultv1.PcrResult,
 	normalizedBudget int,
 ) eventLogReplay {
 	eventLog, err := attest.ParseEventLog(raw)
@@ -83,13 +83,13 @@ func replayEventLog(
 	}
 }
 
-type pcrReplay map[int]attestuxv1.VerificationState
+type pcrReplay map[int]resultv1.ReplayState
 
 func replayAttestedPCRs(
 	eventLog *attest.EventLog,
 	pcrs []attest.PCR,
 	allEvents []attest.Event,
-	pcrResults []*attestuxv1.PcrResult,
+	pcrResults []*resultv1.PcrResult,
 	warn func(string, ...any),
 ) pcrReplay {
 	replay := make(pcrReplay, len(pcrs))
@@ -101,7 +101,7 @@ func replayAttestedPCRs(
 			replayErr = requireEventLogExplainsPCR(pcr, verifiedEvents, allEvents)
 		}
 		if replayErr != nil {
-			replay[pcr.Index] = attestuxv1.VerificationState_VERIFICATION_STATE_FAILED
+			replay[pcr.Index] = resultv1.ReplayState_REPLAY_STATE_FAILED
 			warn(
 				"PCR %d SHA-256 quote verified, but event-log replay failed: %v",
 				pcr.Index,
@@ -119,7 +119,7 @@ func replayAttestedPCRs(
 				unlogged,
 			)
 		}
-		replay[pcr.Index] = attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED
+		replay[pcr.Index] = resultv1.ReplayState_REPLAY_STATE_VERIFIED
 		setPCRReplayed(pcrResults, pcr.Index, len(verifiedEvents), unlogged > 0)
 	}
 	return replay
@@ -128,19 +128,15 @@ func replayAttestedPCRs(
 func (r pcrReplay) classifyEvent(
 	algorithmID uint32,
 	event attest.Event,
-) attestuxv1.VerificationState {
-	if algorithmID != attestation.TPMAlgSHA256 {
-		return attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED
+) resultv1.ReplayState {
+	if algorithmID != attestation.TPMAlgSHA256 || !isExtendingEvent(event) {
+		return resultv1.ReplayState_REPLAY_STATE_UNVERIFIED
 	}
 	switch state := r[event.Index]; state {
-	case attestuxv1.VerificationState_VERIFICATION_STATE_FAILED:
+	case resultv1.ReplayState_REPLAY_STATE_FAILED, resultv1.ReplayState_REPLAY_STATE_VERIFIED:
 		return state
-	case attestuxv1.VerificationState_VERIFICATION_STATE_VERIFIED:
-		if isExtendingEvent(event) {
-			return state
-		}
 	}
-	return attestuxv1.VerificationState_VERIFICATION_STATE_UNVERIFIED
+	return resultv1.ReplayState_REPLAY_STATE_UNVERIFIED
 }
 
 type algorithmEvents struct {
@@ -179,10 +175,10 @@ func normalizeEventsWithinBudget(
 	algorithms []algorithmEvents,
 	replay pcrReplay,
 	budget int,
-) []*attestuxv1.Event {
+) []*resultv1.Event {
 	// Allow room for the parent field tag and length prefix.
 	const repeatedMessageOverhead = 6
-	normalized := make([]*attestuxv1.Event, 0, len(allEvents))
+	normalized := make([]*resultv1.Event, 0, len(allEvents))
 	size := 0
 	for sequence, source := range allEvents {
 		event := normalizeEvent(source, uint32(sequence))
@@ -193,7 +189,7 @@ func normalizeEventsWithinBudget(
 			}
 			event.Digests = append(
 				event.Digests,
-				&attestuxv1.EventDigest{
+				&resultv1.EventDigest{
 					Digest:        bytes.Clone(digested.Digest),
 					State:         replay.classifyEvent(algorithm.id, digested),
 					HashAlgorithm: algorithm.id,
@@ -212,7 +208,7 @@ func normalizeEventsWithinBudget(
 
 // Zero events is only valid if the PCR hasn't left its initial value.
 func setPCRReplayed(
-	results []*attestuxv1.PcrResult,
+	results []*resultv1.PcrResult,
 	index int,
 	replayedEvents int,
 	usedUnloggedEvents bool,

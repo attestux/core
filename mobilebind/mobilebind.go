@@ -7,23 +7,25 @@ import (
 
 	"github.com/attestux/core/attestation"
 	"github.com/attestux/core/verifier"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"google.golang.org/protobuf/proto"
 )
 
 type verificationSession interface {
-	Report() *attestuxv1.VerificationReport
+	Report() *resultv1.VerificationReport
 	ActivationChallenge() *attestuxv1.CredentialActivationChallenge
-	CompleteActivationBytes([]byte) (*attestuxv1.VerificationReport, error)
-	RejectActivation() (*attestuxv1.VerificationReport, error)
+	CompleteEvidence([]byte) (*resultv1.VerificationReport, error)
+	RejectActivation() (*resultv1.VerificationReport, error)
+	RejectEvidence() (*resultv1.VerificationReport, error)
 	Cancel()
 }
 
 // Verifier owns one activation session. Create and close one for each Android channel.
 type Verifier struct {
 	mu      sync.Mutex
-	nonce   []byte
+	issued  bool
 	session verificationSession
 	closed  bool
 }
@@ -32,7 +34,7 @@ func NewVerifier() *Verifier {
 	return &Verifier{}
 }
 
-// Only accept evidence for the nonce this verifier sent.
+// Begin key discovery; the secret challenge is generated after key validation.
 func (v *Verifier) IssueChallenge() ([]byte, error) {
 	challenge := attestation.NewChallenge()
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(challenge)
@@ -44,16 +46,17 @@ func (v *Verifier) IssueChallenge() ([]byte, error) {
 	if v.closed {
 		return nil, errors.New("verifier is closed")
 	}
-	if v.nonce != nil {
+	if v.issued {
 		return nil, errors.New("verifier has already issued an attestation challenge")
 	}
-	v.nonce = challenge.Nonce
+	v.issued = true
 	return raw, nil
 }
 
-// PrepareVerification checks evidence and returns an activation challenge.
-// The secret stays in this verifier.
-func (v *Verifier) PrepareVerification(evidence []byte) ([]byte, error) {
+// PrepareVerification checks an encoded AttestationHello and returns an encrypted
+// activation challenge, or a terminal completion if the hello is rejected.
+// Only the hash of its secret remains in this verifier.
+func (v *Verifier) PrepareVerification(hello []byte) ([]byte, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.closed {
@@ -62,13 +65,10 @@ func (v *Verifier) PrepareVerification(evidence []byte) ([]byte, error) {
 	if v.session != nil {
 		return nil, errors.New("verifier has already been used")
 	}
-	if v.nonce == nil {
+	if !v.issued {
 		return nil, errors.New("verifier has not issued an attestation challenge")
 	}
-	session, err := verifier.PrepareVerification(evidence, v.nonce)
-	if err != nil {
-		return nil, err
-	}
+	session := verifier.PrepareVerification(hello)
 	v.session = session
 	return encodePreparationOrCancel(session)
 }
@@ -83,9 +83,9 @@ func encodePreparationOrCancel(session verificationSession) ([]byte, error) {
 	return raw, err
 }
 
-func (v *Verifier) CompleteActivation(responseBytes []byte) ([]byte, error) {
-	return v.complete(func(session verificationSession) (*attestuxv1.VerificationReport, error) {
-		return session.CompleteActivationBytes(responseBytes)
+func (v *Verifier) CompleteEvidence(evidenceBytes []byte) ([]byte, error) {
+	return v.complete(func(session verificationSession) (*resultv1.VerificationReport, error) {
+		return session.CompleteEvidence(evidenceBytes)
 	})
 }
 
@@ -93,8 +93,12 @@ func (v *Verifier) RejectActivation() ([]byte, error) {
 	return v.complete(verificationSession.RejectActivation)
 }
 
+func (v *Verifier) RejectEvidence() ([]byte, error) {
+	return v.complete(verificationSession.RejectEvidence)
+}
+
 func (v *Verifier) complete(
-	complete func(verificationSession) (*attestuxv1.VerificationReport, error),
+	complete func(verificationSession) (*resultv1.VerificationReport, error),
 ) ([]byte, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -119,7 +123,6 @@ func (v *Verifier) Close() {
 		return
 	}
 	v.closed = true
-	v.nonce = nil
 	if v.session != nil {
 		v.session.Cancel()
 	}

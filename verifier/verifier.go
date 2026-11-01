@@ -3,7 +3,6 @@ package verifier
 import (
 	"bytes"
 	"crypto/sha256"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"slices"
@@ -11,7 +10,8 @@ import (
 	"time"
 
 	"github.com/attestux/core/attestation"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 
 	"github.com/google/go-attestation/attest"
 	"google.golang.org/protobuf/proto"
@@ -19,20 +19,18 @@ import (
 
 type VerificationSession struct {
 	mu                   sync.Mutex
-	report               *attestuxv1.VerificationReport
+	report               *resultv1.VerificationReport
 	activationChallenge  *attestuxv1.CredentialActivationChallenge
-	expectedSecret       []byte
+	expectedQuoteNonce   []byte
+	keys                 *attestuxv1.AttestationKeys
+	deviceID             string
 	policy               verificationPolicy
 	endorsementKeySHA256 []byte
 }
 
-func PrepareVerification(
-	evidenceBytes,
-	expectedNonce []byte,
-) (*VerificationSession, error) {
+func PrepareVerification(helloBytes []byte) *VerificationSession {
 	return prepareVerificationWithPolicies(
-		evidenceBytes,
-		expectedNonce,
+		helloBytes,
 		runtimeVerificationPolicies(),
 		time.Now(),
 	)
@@ -75,43 +73,44 @@ func selectEndorsementPolicy(
 }
 
 func prepareVerificationWithPolicies(
-	evidenceBytes,
-	expectedNonce []byte,
+	helloBytes []byte,
 	policies []verificationPolicy,
 	now time.Time,
-) (*VerificationSession, error) {
-	if err := attestation.ValidateChallengeNonce(expectedNonce); err != nil {
-		return nil, fmt.Errorf("expected nonce: %w", err)
+) *VerificationSession {
+	report := &resultv1.VerificationReport{
+		Status: attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION,
 	}
-	// Put bad evidence in the report. A bad nonce is the caller's error.
-	report := &attestuxv1.VerificationReport{}
-	var evidence attestuxv1.AttestationEvidence
-	var pcrs []attest.PCR
-	if len(evidenceBytes) == 0 || len(evidenceBytes) > attestation.MaxEvidenceSize {
-		failReport(report, "malformed evidence: size %d is outside permitted range", len(evidenceBytes))
-	} else if err := (proto.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(
-		evidenceBytes,
-		&evidence,
-	); err != nil {
-		failReport(report, "malformed evidence: %v", err)
-	} else if err := attestation.ValidateEvidence(&evidence); err != nil {
-		failReport(report, "%v", err)
-	} else {
-		report, pcrs = buildQuoteReportAndPCRs(&evidence, expectedNonce)
-	}
-	sum := sha256.Sum256(evidenceBytes)
+	sum := sha256.Sum256(helloBytes)
 	report.EvidenceSha256 = sum[:]
 	session := &VerificationSession{report: report}
-	if len(report.Errors) != 0 {
-		return session, nil
+	var hello attestuxv1.AttestationHello
+	// Hello and evidence data may carry unknown metadata. Only challenges are
+	// validated strictly by the prover, because they request actions; a response
+	// cannot require an older prover to do anything new.
+	if len(helloBytes) == 0 || len(helloBytes) > attestation.MaxControlMessageSize {
+		failReport(report, "malformed attestation hello: size %d is outside permitted range", len(helloBytes))
+	} else if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(helloBytes, &hello); err != nil {
+		failReport(report, "malformed attestation hello: %v", err)
+	} else if err := attestation.ValidateKeys(hello.Keys); err != nil {
+		failReport(report, "%v", err)
 	}
-	if err := attestation.RequireSHA256SignatureEncoding(evidence.AkCreateSignature); err != nil {
+	if len(report.Errors) != 0 {
+		return session
+	}
+	keys := hello.Keys
+	// Validate the exact public encoding before creating an activation challenge.
+	deviceID, err := attestation.DeviceID(keys.AttestationPublic)
+	if err != nil {
+		failReport(report, "parse attestation public key: %v", err)
+		return session
+	}
+	if err := attestation.RequireSHA256SignatureEncoding(keys.AkCreateSignature); err != nil {
 		failReport(report, "attestation key creation signature: %v", err)
-		return session, nil
+		return session
 	}
 
 	endorsement, policy, err := selectEndorsementPolicy(
-		evidence.EndorsementKeys,
+		keys.EndorsementKeys,
 		policies,
 		now,
 	)
@@ -121,7 +120,7 @@ func prepareVerificationWithPolicies(
 			"endorsement certificate verification failed: %v",
 			err,
 		)
-		return session, nil
+		return session
 	}
 	// Don't name the policy or EK until activation ties them to the AK.
 	session.policy = policy
@@ -129,10 +128,10 @@ func prepareVerificationWithPolicies(
 	activation := attest.ActivationParameters{
 		EK: endorsement.publicKey,
 		AK: attest.AttestationParameters{
-			Public:            bytes.Clone(evidence.AttestationPublic),
-			CreateData:        bytes.Clone(evidence.AkCreateData),
-			CreateAttestation: bytes.Clone(evidence.AkCreateAttestation),
-			CreateSignature:   bytes.Clone(evidence.AkCreateSignature),
+			Public:            bytes.Clone(keys.AttestationPublic),
+			CreateData:        bytes.Clone(keys.AkCreateData),
+			CreateAttestation: bytes.Clone(keys.AkCreateAttestation),
+			CreateSignature:   bytes.Clone(keys.AkCreateSignature),
 		},
 	}
 	// Check AK creation on its own so we can tell AK and EK failures apart.
@@ -142,7 +141,7 @@ func prepareVerificationWithPolicies(
 			"attestation key is not TPM-created: %v",
 			err,
 		)
-		return session, nil
+		return session
 	}
 	secret, encrypted, err := activation.Generate()
 	if err != nil {
@@ -151,22 +150,24 @@ func prepareVerificationWithPolicies(
 			"build credential activation challenge for the certified endorsement key: %v",
 			err,
 		)
-		return session, nil
+		return session
 	}
-	attachEventLogReplay(report, evidence.EventLog, pcrs)
-	session.expectedSecret = secret
+	session.expectedQuoteNonce = attestation.ActivationQuoteNonce(secret)
+	clear(secret)
+	session.keys = keys
+	session.deviceID = deviceID
 	session.activationChallenge = &attestuxv1.CredentialActivationChallenge{
 		EndorsementKeySha256: bytes.Clone(endorsement.publicSHA256),
 		Credential:           bytes.Clone(encrypted.Credential),
 		EncryptedSecret:      bytes.Clone(encrypted.Secret),
 	}
-	return session, nil
+	return session
 }
 
-func (s *VerificationSession) Report() *attestuxv1.VerificationReport {
+func (s *VerificationSession) Report() *resultv1.VerificationReport {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return proto.Clone(s.report).(*attestuxv1.VerificationReport)
+	return proto.Clone(s.report).(*resultv1.VerificationReport)
 }
 
 func (s *VerificationSession) ActivationChallenge() *attestuxv1.CredentialActivationChallenge {
@@ -184,64 +185,74 @@ func (s *VerificationSession) Cancel() {
 	s.clearPendingActivation()
 }
 
-func (s *VerificationSession) RejectActivation() (
-	*attestuxv1.VerificationReport,
-	error,
-) {
-	return s.finishActivation(nil, "prover reported credential activation failure")
+func (s *VerificationSession) RejectActivation() (*resultv1.VerificationReport, error) {
+	return s.completeEvidence(nil, "TPM credential activation failed: prover reported credential activation failure")
 }
 
-func (s *VerificationSession) CompleteActivationBytes(
-	responseBytes []byte,
-) (*attestuxv1.VerificationReport, error) {
-	if len(responseBytes) == 0 ||
-		len(responseBytes) > attestation.MaxActivationMessageSize {
-		return s.finishActivation(nil, fmt.Sprintf("response has invalid size %d", len(responseBytes)))
-	}
-	var response attestuxv1.CredentialActivationResponse
-	if err := proto.Unmarshal(responseBytes, &response); err != nil {
-		return s.finishActivation(nil, fmt.Sprintf("response could not be decoded: %v", err))
-	}
-	return s.finishActivation(response.Secret, "")
+func (s *VerificationSession) RejectEvidence() (*resultv1.VerificationReport, error) {
+	return s.completeEvidence(nil, "prover reported attestation failure")
 }
 
-// All activation outcomes consume the challenge and erase its secret under one lock.
-func (s *VerificationSession) finishActivation(
-	secret []byte,
-	failure string,
-) (*attestuxv1.VerificationReport, error) {
+func (s *VerificationSession) CompleteEvidence(evidenceBytes []byte) (*resultv1.VerificationReport, error) {
+	return s.completeEvidence(evidenceBytes, "")
+}
+
+func (s *VerificationSession) completeEvidence(evidenceBytes []byte, failure string) (*resultv1.VerificationReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.activationChallenge == nil {
 		return nil, errors.New("verification session has no pending activation")
 	}
-	if failure == "" && subtle.ConstantTimeCompare(secret, s.expectedSecret) != 1 {
-		failure = "TPM credential activation secret did not match"
-	}
-
-	s.clearPendingActivation()
+	defer s.clearPendingActivation()
+	report := s.report
 	if failure != "" {
-		failReport(s.report, "TPM credential activation failed: %s", failure)
+		failReport(report, "%s", failure)
+		return proto.Clone(report).(*resultv1.VerificationReport), nil
+	}
+	sum := sha256.Sum256(evidenceBytes)
+	report.EvidenceSha256 = sum[:]
+	var evidence attestuxv1.AttestationEvidence
+	if len(evidenceBytes) == 0 || len(evidenceBytes) > attestation.MaxEvidenceSize {
+		failReport(report, "malformed evidence: size %d is outside permitted range", len(evidenceBytes))
+	} else if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(evidenceBytes, &evidence); err != nil {
+		failReport(report, "malformed evidence: %v", err)
+	} else if err := attestation.ValidateEvidence(&evidence); err != nil {
+		failReport(report, "%v", err)
+	} else if !proto.Equal(evidence.Keys, s.keys) {
+		failReport(report, "evidence keys do not match the credential activation challenge")
 	} else {
-		s.report.Status = attestuxv1.VerificationStatus_VERIFICATION_STATUS_VERIFIED
-		s.report.TrustPolicy = s.policy.id
-		s.report.EndorsementKeySha256 = s.endorsementKeySHA256
-		if s.policy.limitation != "" {
-			s.report.Limitations = slices.Insert(s.report.Limitations, 0, s.policy.limitation)
+		pcrs, pcrResults, err := verifyQuotedPCRs(&evidence, s.expectedQuoteNonce)
+		if err != nil {
+			failReport(report, "%v", err)
+		} else {
+			report.DeviceId = s.deviceID
+			report.Pcrs = pcrResults
+			if warning := unsupportedPCRBankWarning(&evidence); warning != "" {
+				report.Warnings = append(report.Warnings, warning)
+			}
+			attachEventLogReplay(report, evidence.EventLog, pcrs)
+			report.Status = attestuxv1.VerificationStatus_VERIFICATION_STATUS_VERIFIED
+			report.TrustPolicy = s.policy.id
+			report.EndorsementKeySha256 = bytes.Clone(s.endorsementKeySHA256)
+			if s.policy.limitation != "" {
+				report.Limitations = slices.Insert(report.Limitations, 0, s.policy.limitation)
+			}
 		}
 	}
-	return proto.Clone(s.report).(*attestuxv1.VerificationReport), nil
+	return proto.Clone(report).(*resultv1.VerificationReport), nil
 }
 
 func (s *VerificationSession) clearPendingActivation() {
-	clear(s.expectedSecret)
-	s.expectedSecret = nil
+	clear(s.expectedQuoteNonce)
+	s.expectedQuoteNonce = nil
 	s.activationChallenge = nil
+	s.keys = nil
+	s.deviceID = ""
 }
 
 // Every failure path appends one error and returns, so a report holds only a few.
 func failReport(
-	report *attestuxv1.VerificationReport,
+	report *resultv1.VerificationReport,
 	format string,
 	args ...any,
 ) {
@@ -254,32 +265,9 @@ func diagnostic(format string, args ...any) string {
 	return truncateText(fmt.Sprintf(format, args...), maxDiagnosticMessageBytes)
 }
 
-func buildQuoteReportAndPCRs(
-	e *attestuxv1.AttestationEvidence,
-	expectedNonce []byte,
-) (*attestuxv1.VerificationReport, []attest.PCR) {
-	report := &attestuxv1.VerificationReport{
-		Status: attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION,
-	}
-	deviceID, pcrs, pcrResults, err := verifyQuotedPCRs(e, expectedNonce)
-	// Keep the verified quote identity even when a later check rejects the evidence.
-	report.DeviceId = deviceID
-	if err != nil {
-		failReport(report, "%v", err)
-		return report, nil
-	}
-	report.Pcrs = pcrResults
-
-	// Don't describe the PCRs until the quote verifies.
-	if warning := unsupportedPCRBankWarning(e); warning != "" {
-		report.Warnings = append(report.Warnings, warning)
-	}
-	return report, pcrs
-}
-
-// Replay is expensive. Wait until AK and certified EK checks pass.
+// Replay is expensive. Run it only after the challenged key's quote verifies.
 func attachEventLogReplay(
-	report *attestuxv1.VerificationReport,
+	report *resultv1.VerificationReport,
 	eventLog []byte,
 	pcrs []attest.PCR,
 ) {

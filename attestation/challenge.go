@@ -1,26 +1,20 @@
 package attestation
 
 import (
-	"crypto/rand"
-	"fmt"
+	"crypto/sha256"
 
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 )
 
-func ValidateChallengeNonce(nonce []byte) error {
-	if len(nonce) < minNonceSize || len(nonce) > MaxNonceSize {
-		return fmt.Errorf(
-			"nonce size %d is outside the permitted range of %d to %d bytes",
-			len(nonce),
-			minNonceSize,
-			MaxNonceSize,
-		)
-	}
-	return nil
-}
+const ProtocolVersion = 1
 
 func NewChallenge() *attestuxv1.AttestationChallenge {
-	nonce := make([]byte, MaxNonceSize)
-	rand.Read(nonce)
-	return &attestuxv1.AttestationChallenge{Nonce: nonce}
+	return &attestuxv1.AttestationChallenge{ProtocolVersion: ProtocolVersion}
+}
+
+// ActivationQuoteNonce is the only representation of the recovered secret sent
+// back to the verifier. TPM quotes expose their extraData in clear text.
+func ActivationQuoteNonce(secret []byte) []byte {
+	digest := sha256.Sum256(secret)
+	return digest[:]
 }
