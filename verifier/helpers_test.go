@@ -8,11 +8,14 @@ import (
 	_ "crypto/sha512"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/attestux/core/attestation"
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/result/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/google/go-attestation/attest"
@@ -28,24 +31,31 @@ func marshalEvidence(t testing.TB, evidence *attestuxv1.AttestationEvidence) []b
 	return raw
 }
 
+func marshalHello(t testing.TB, keys *attestuxv1.AttestationKeys) []byte {
+	t.Helper()
+	raw, err := proto.Marshal(&attestuxv1.AttestationHello{Keys: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
 // Every completion path must forget the activation, refuse a second answer
 // for that reason alone, and leave the final report as it is.
-func requireActivationFinished(t testing.TB, session *VerificationSession, secret []byte) {
+func requireActivationFinished(t testing.TB, session *VerificationSession, nonce []byte) {
 	t.Helper()
-	if session.ActivationChallenge() != nil || session.expectedSecret != nil {
+	if session.ActivationChallenge() != nil || session.expectedQuoteNonce != nil {
 		t.Fatal("activation state survived completion")
 	}
-	if !bytes.Equal(secret, make([]byte, len(secret))) {
-		t.Fatal("secret bytes survived completion")
+	if !bytes.Equal(nonce, make([]byte, len(nonce))) {
+		t.Fatal("quote challenge nonce survived completion")
 	}
 	final := session.Report()
-	for name, retry := range map[string]func() (*attestuxv1.VerificationReport, error){
-		"rejection": session.RejectActivation,
-		"completion": func() (*attestuxv1.VerificationReport, error) {
-			return session.finishActivation(nil, "")
-		},
-		"completion bytes": func() (*attestuxv1.VerificationReport, error) {
-			return session.CompleteActivationBytes(nil)
+	for name, retry := range map[string]func() (*resultv1.VerificationReport, error){
+		"rejection":          session.RejectActivation,
+		"evidence rejection": session.RejectEvidence,
+		"completion": func() (*resultv1.VerificationReport, error) {
+			return session.CompleteEvidence(nil)
 		},
 	} {
 		if _, err := retry(); err == nil || !strings.Contains(err.Error(), "no pending activation") {
@@ -54,6 +64,18 @@ func requireActivationFinished(t testing.TB, session *VerificationSession, secre
 	}
 	if !proto.Equal(final, session.Report()) {
 		t.Fatal("refused retries changed the final report")
+	}
+}
+
+func requireReportIntegrity(t testing.TB, report *resultv1.VerificationReport, raw []byte) {
+	t.Helper()
+	if sum := sha256.Sum256(raw); !bytes.Equal(report.EvidenceSha256, sum[:]) {
+		t.Fatal("report does not hash the exact received bytes")
+	}
+	for _, text := range slices.Concat(report.Errors, report.Warnings, report.Limitations) {
+		if len(text) > maxDiagnosticMessageBytes+len("...") || !utf8.ValidString(text) {
+			t.Fatalf("unbounded or invalid diagnostic: %q", text)
+		}
 	}
 }
 
@@ -142,17 +164,17 @@ func quotedSHA256PCR(index int, events ...logEvent) []attest.PCR {
 	}}
 }
 
-func singlePCRResult(index uint32) []*attestuxv1.PcrResult {
-	return []*attestuxv1.PcrResult{{
+func singlePCRResult(index uint32) []*resultv1.PcrResult {
+	return []*resultv1.PcrResult{{
 		HashAlgorithm: attestation.TPMAlgSHA256,
 		Pcr:           &attestuxv1.Pcr{Index: index},
 	}}
 }
 
-func attestedPCRResults() []*attestuxv1.PcrResult {
-	results := make([]*attestuxv1.PcrResult, 0, attestation.AttestedPCRCount)
+func attestedPCRResults() []*resultv1.PcrResult {
+	results := make([]*resultv1.PcrResult, 0, attestation.AttestedPCRCount)
 	for index := uint32(0); index < attestation.AttestedPCRCount; index++ {
-		results = append(results, &attestuxv1.PcrResult{
+		results = append(results, &resultv1.PcrResult{
 			HashAlgorithm: attestation.TPMAlgSHA256,
 			Pcr: &attestuxv1.Pcr{
 				Index:  index,
@@ -193,7 +215,7 @@ func writeLE(t testing.TB, out *bytes.Buffer, value any) {
 	}
 }
 
-func describesTrust(report *attestuxv1.VerificationReport) bool {
+func describesTrust(report *resultv1.VerificationReport) bool {
 	return report.TrustPolicy != attestuxv1.TrustPolicy_TRUST_POLICY_UNSPECIFIED ||
 		len(report.EndorsementKeySha256) != 0 ||
 		containsMessage(report.Limitations, "policy limitation")

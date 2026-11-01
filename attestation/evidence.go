@@ -5,12 +5,22 @@ import (
 	"errors"
 	"fmt"
 
-	attestuxv1 "github.com/attestux/protocol-go/attestux/v1"
+	"github.com/attestux/protocol-go/attestux/v1"
 )
 
 func ValidateEvidence(e *attestuxv1.AttestationEvidence) error {
 	if e == nil {
 		return errors.New("missing evidence")
+	}
+	if err := ValidateKeys(e.Keys); err != nil {
+		return err
+	}
+	return validateMeasurements(e)
+}
+
+func ValidateKeys(e *attestuxv1.AttestationKeys) error {
+	if e == nil {
+		return errors.New("missing attestation keys")
 	}
 	if len(e.AttestationPublic) == 0 || len(e.AttestationPublic) > maxAKPublicSize {
 		return errors.New("invalid attestation public-key size")
@@ -28,6 +38,10 @@ func ValidateEvidence(e *attestuxv1.AttestationEvidence) error {
 			len(e.EndorsementKeys),
 		)
 	}
+	return nil
+}
+
+func validateMeasurements(e *attestuxv1.AttestationEvidence) error {
 	if len(e.PcrBanks) == 0 || len(e.PcrBanks) > maxPCRBankCount {
 		return fmt.Errorf(
 			"invalid PCR bank count %d",
@@ -62,9 +76,9 @@ func ValidateEvidence(e *attestuxv1.AttestationEvidence) error {
 			len(bank.Pcrs),
 		)
 	}
-	for i, p := range bank.Pcrs {
+	for _, p := range bank.Pcrs {
 		if p.Index >= AttestedPCRCount {
-			return fmt.Errorf("invalid PCR %d", i)
+			return fmt.Errorf("invalid PCR %d", p.Index)
 		}
 	}
 	if len(e.EventLog) < minEventLogSize || len(e.EventLog) > MaxEventLogSize {

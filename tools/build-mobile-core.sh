@@ -15,8 +15,9 @@ export ANDROID_NDK_HOME="${ANDROID_HOME}/ndk/${ndk_version}"
 export PATH="${project_dir}/build/mobile-tools:${PATH}"
 GOTOOLCHAIN="$(go env GOVERSION)"
 export GOTOOLCHAIN
-# Select simulator trust only through this script's argument.
-export GOFLAGS=
+# Empty GOFLAGS reuses saved flags: simulator tags could make production AARs
+# fail the trust check. Keep this override non-empty to block saved flags.
+export GOFLAGS=-buildvcs=false
 cd "${project_dir}"
 go build -o "${project_dir}/build/mobile-tools/" \
 	golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
