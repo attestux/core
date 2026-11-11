@@ -12,18 +12,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const (
-	maxProtobufEnvelopeOverhead = 1024
-	maxCompletionBytes          = verifier.MaxReportSize +
-		verifier.MaxReceiptSize + maxProtobufEnvelopeOverhead
-)
-
 func marshalCompletion(report *resultv1.VerificationReport) ([]byte, error) {
 	completion, err := verifier.CompletionForReport(report)
 	if err != nil {
 		return nil, err
 	}
-	return marshalBounded(completion, "verification completion")
+	return marshalLocal(completion, "verification completion")
 }
 
 // The activation challenge still has to fit the wire limit inside this local envelope.
@@ -46,19 +40,13 @@ func marshalPreparation(
 			ActivationChallenge: challenge,
 		}
 	}
-	return marshalBounded(preparation, "verification preparation")
+	return marshalLocal(preparation, "verification preparation")
 }
 
-func marshalBounded(
-	message proto.Message,
-	name string,
-) ([]byte, error) {
+func marshalLocal(message proto.Message, name string) ([]byte, error) {
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(message)
 	if err != nil {
 		return nil, fmt.Errorf("encode %s: %w", name, err)
-	}
-	if len(raw) > maxCompletionBytes {
-		return nil, fmt.Errorf("%s exceeds local limits", name)
 	}
 	return raw, nil
 }
