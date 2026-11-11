@@ -85,6 +85,26 @@ func TestValidateEvidenceChecksShape(t *testing.T) {
 		{"missing SHA-256 bank", func(e *attestuxv1.AttestationEvidence) {
 			e.PcrBanks[0] = attestationtest.MakeUnsupportedPCRBank(e, 0x000d, 64)
 		}, "required SHA-256 PCR bank"},
+		{"duplicate SHA-512 bank", func(e *attestuxv1.AttestationEvidence) {
+			bank := attestationtest.MakeUnsupportedPCRBank(e, 0x000d, 64)
+			e.PcrBanks = append(e.PcrBanks, bank, proto.Clone(bank).(*attestuxv1.PcrBankEvidence))
+		}, "multiple SHA-512 PCR banks"},
+		{"duplicate unknown bank", func(e *attestuxv1.AttestationEvidence) {
+			bank := attestationtest.MakeUnsupportedPCRBank(e, 0x0042, 17)
+			e.PcrBanks = append(e.PcrBanks, bank, proto.Clone(bank).(*attestuxv1.PcrBankEvidence))
+		}, "multiple TPM_ALG 0x42 PCR banks"},
+		{"event log below the TCG header", func(e *attestuxv1.AttestationEvidence) {
+			e.EventLog = make([]byte, minEventLogSize-1)
+		}, "invalid event-log size"},
+		{"smallest accepted event log", func(e *attestuxv1.AttestationEvidence) {
+			e.EventLog = make([]byte, minEventLogSize)
+		}, ""},
+		{"largest accepted event log", func(e *attestuxv1.AttestationEvidence) {
+			e.EventLog = make([]byte, MaxEventLogSize)
+		}, ""},
+		{"event log beyond the limit", func(e *attestuxv1.AttestationEvidence) {
+			e.EventLog = make([]byte, MaxEventLogSize+1)
+		}, "invalid event-log size"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			e := attestationtest.MinimallyShapedEvidence()
@@ -98,57 +118,6 @@ func TestValidateEvidenceChecksShape(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("error = %v, want it to contain %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestValidateEvidenceBoundsEventLogSize(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		size   int
-		accept bool
-	}{
-		{"below the TCG header", minEventLogSize - 1, false},
-		{"smallest accepted log", minEventLogSize, true},
-		{"largest accepted log", MaxEventLogSize, true},
-		{"beyond the limit", MaxEventLogSize + 1, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			e := attestationtest.MinimallyShapedEvidence()
-			e.EventLog = make([]byte, test.size)
-			err := ValidateEvidence(e)
-			if test.accept && err != nil {
-				t.Fatalf("rejected a %d byte event log: %v", test.size, err)
-			}
-			if !test.accept && err == nil {
-				t.Fatalf("accepted a %d byte event log", test.size)
-			}
-		})
-	}
-}
-
-func TestValidateEvidenceRejectsDuplicateUnsupportedBanks(t *testing.T) {
-	tests := []struct {
-		name       string
-		algorithm  uint32
-		digestSize int
-	}{
-		{name: "known", algorithm: 0x000d, digestSize: 64},
-		{name: "unknown", algorithm: 0x0042, digestSize: 17},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			evidence := attestationtest.MinimallyShapedEvidence()
-			bank := attestationtest.MakeUnsupportedPCRBank(evidence, test.algorithm, test.digestSize)
-			evidence.PcrBanks = append(
-				evidence.PcrBanks,
-				bank,
-				proto.Clone(bank).(*attestuxv1.PcrBankEvidence),
-			)
-			if err := ValidateEvidence(evidence); err == nil ||
-				!strings.Contains(err.Error(), "multiple") {
-				t.Fatalf("duplicate bank error = %v", err)
 			}
 		})
 	}

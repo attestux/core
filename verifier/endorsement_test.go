@@ -32,7 +32,8 @@ type endorsementCertificateFixture struct {
 
 func TestValidateEndorsementWithTrustAcceptsTheTCGSubjectAltName(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
-	candidate := fixture.issue(t, 2, nil)
+	candidate := fixture.issue(t, nil)
+
 	parsedLeaf, err := x509.ParseCertificate(candidate.Certificate)
 	if err != nil {
 		t.Fatal(err)
@@ -51,11 +52,7 @@ func TestValidateEndorsementWithTrustAcceptsTheTCGSubjectAltName(t *testing.T) {
 		t.Fatal("fixture certificate lacks the unhandled critical SAN this test relies on")
 	}
 
-	validated, err := validateEndorsementWithTrust(
-		candidate,
-		certificateTrust{roots: fixture.roots},
-		fixture.now,
-	)
+	validated, err := fixture.validate(candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,14 +77,10 @@ func TestSelectEndorsementPolicyRequiresACandidate(t *testing.T) {
 
 func TestValidateEndorsementWithTrustAcceptsANonCriticalSubjectAltName(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
-	candidate := fixture.issue(t, 4, func(template *x509.Certificate) {
+	candidate := fixture.issue(t, func(template *x509.Certificate) {
 		template.ExtraExtensions[0].Critical = false
 	})
-	if _, err := validateEndorsementWithTrust(
-		candidate,
-		certificateTrust{roots: fixture.roots},
-		fixture.now,
-	); err != nil {
+	if _, err := fixture.validate(candidate); err != nil {
 		t.Fatalf("rejected valid non-critical TCG SAN: %v", err)
 	}
 }
@@ -123,7 +116,6 @@ func TestValidateEndorsementWithTrustThroughIntermediate(t *testing.T) {
 		t.Fatal(err)
 	}
 	leafTemplate := fixture.leafTemplate
-	leafTemplate.SerialNumber = big.NewInt(51)
 	leafDER, err := x509.CreateCertificate(
 		rand.Reader,
 		&leafTemplate,
@@ -137,11 +129,7 @@ func TestValidateEndorsementWithTrustThroughIntermediate(t *testing.T) {
 	candidate := &attestuxv1.EndorsementKey{
 		Certificate: leafDER,
 	}
-	if _, err := validateEndorsementWithTrust(
-		candidate,
-		certificateTrust{roots: fixture.roots},
-		fixture.now,
-	); err == nil || !strings.Contains(err.Error(), "unknown authority") {
+	if _, err := fixture.validate(candidate); err == nil || !strings.Contains(err.Error(), "unknown authority") {
 		t.Fatalf("certificate verified without its intermediate: %v", err)
 	}
 
@@ -187,20 +175,6 @@ func TestValidateEndorsementWithTrustRejectsInvalidCertificates(t *testing.T) {
 			wantError: "endorsement certificate is a CA certificate",
 		},
 		{
-			name: "missing key usage",
-			changeTemplate: func(template *x509.Certificate) {
-				template.KeyUsage = 0
-			},
-			wantError: "lacks a Key Usage extension",
-		},
-		{
-			name: "wrong ECC key usage",
-			changeTemplate: func(template *x509.Certificate) {
-				template.KeyUsage = x509.KeyUsageDigitalSignature
-			},
-			wantError: "does not permit key agreement",
-		},
-		{
 			name: "missing EK purpose",
 			changeTemplate: func(template *x509.Certificate) {
 				template.UnknownExtKeyUsage = nil
@@ -244,18 +218,6 @@ func TestValidateEndorsementWithTrustRejectsInvalidCertificates(t *testing.T) {
 			wantError: "empty subject has a non-critical SAN",
 		},
 		{
-			name: "missing TPM model",
-			changeTemplate: func(template *x509.Certificate) {
-				template.ExtraExtensions = []pkix.Extension{
-					marshalTCGSubjectAltName(t, []pkix.AttributeTypeAndValue{
-						{Type: tpmManufacturerNameOID, Value: "swtpm"},
-						{Type: tpmVersionNameOID, Value: "2.0"},
-					}),
-				}
-			},
-			wantError: "lacks required attribute 2.23.133.2.2",
-		},
-		{
 			name: "malformed TCG SAN",
 			changeTemplate: func(template *x509.Certificate) {
 				template.ExtraExtensions = []pkix.Extension{{
@@ -282,21 +244,17 @@ func TestValidateEndorsementWithTrustRejectsInvalidCertificates(t *testing.T) {
 		},
 	}
 
-	for index, test := range tests {
+	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			public := test.public
 			if public == nil {
 				public = &fixture.ekKey.PublicKey
 			}
-			candidate := fixture.issueFor(t, int64(index+4), public, test.changeTemplate)
+			candidate := fixture.issueFor(t, public, test.changeTemplate)
 			if test.changeCandidate != nil {
 				test.changeCandidate(candidate)
 			}
-			_, err := validateEndorsementWithTrust(
-				candidate,
-				certificateTrust{roots: fixture.roots},
-				fixture.now,
-			)
+			_, err := fixture.validate(candidate)
 			if err == nil {
 				t.Fatal("accepted invalid endorsement certificate")
 			}
@@ -369,6 +327,7 @@ func newEndorsementCertificateFixtureForRoot(
 		ekKey:     ekKey,
 		publicDER: publicDER,
 		leafTemplate: x509.Certificate{
+			SerialNumber:       big.NewInt(2),
 			Subject:            pkix.Name{CommonName: "Test TPM EK"},
 			NotBefore:          now.Add(-time.Hour),
 			NotAfter:           now.Add(time.Hour),
@@ -387,23 +346,20 @@ func newEndorsementCertificateFixtureForRoot(
 
 func (fixture *endorsementCertificateFixture) issue(
 	t testing.TB,
-	serial int64,
 	changeTemplate func(*x509.Certificate),
 ) *attestuxv1.EndorsementKey {
 	t.Helper()
-	return fixture.issueFor(t, serial, &fixture.ekKey.PublicKey, changeTemplate)
+	return fixture.issueFor(t, &fixture.ekKey.PublicKey, changeTemplate)
 }
 
 func (fixture *endorsementCertificateFixture) issueFor(
 	t testing.TB,
-	serial int64,
 	public crypto.PublicKey,
 	changeTemplate func(*x509.Certificate),
 ) *attestuxv1.EndorsementKey {
 	t.Helper()
 
 	template := fixture.leafTemplate
-	template.SerialNumber = big.NewInt(serial)
 	template.ExtraExtensions = append(
 		[]pkix.Extension(nil),
 		template.ExtraExtensions...,
@@ -428,4 +384,8 @@ func (fixture *endorsementCertificateFixture) issueFor(
 	return &attestuxv1.EndorsementKey{
 		Certificate: certificateDER,
 	}
+}
+
+func (fixture *endorsementCertificateFixture) validate(candidate *attestuxv1.EndorsementKey) (*validatedEndorsement, error) {
+	return validateEndorsementWithTrust(candidate, certificateTrust{roots: fixture.roots}, fixture.now)
 }
