@@ -7,6 +7,7 @@ import (
 )
 
 const ProtocolVersion = 1
+const ProverNonceSize = 32
 
 func NewChallenge() *attestuxv1.AttestationChallenge {
 	return &attestuxv1.AttestationChallenge{ProtocolVersion: ProtocolVersion}
