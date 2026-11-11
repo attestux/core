@@ -32,7 +32,7 @@ func TestUnknownFields(t *testing.T) {
 				evidence.Keys.ProtoReflect().SetUnknown(unknown)
 				evidence.Keys.EndorsementKeys[0].ProtoReflect().SetUnknown(unknown)
 			}
-			hello := &attestuxv1.AttestationHello{Keys: keys}
+			hello := &attestuxv1.AttestationHello{Keys: keys, ProverNonce: bytes.Repeat([]byte{7}, attestation.ProverNonceSize)}
 			if target == "hello" || target == "both" {
 				hello.ProtoReflect().SetUnknown(unknown)
 			}

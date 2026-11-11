@@ -2,8 +2,8 @@ github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk
 github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260915221818-a6c0685fb9fc h1:LPSfe+IaXHrYCNzEVZ4O48UdwNxtiNIEwKgIyU4Aawg=
 github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260915221818-a6c0685fb9fc/go.mod h1:M77DH8QPPCBBzfdwZPIWpAZdDHJZu0icyq6HTZAEojI=
-github.com/attestux/protocol-go v0.0.0-20261102143929-cf69bfca3250 h1:7pH6SmOmRnpLuu6BAnpFZ6RL79Sv6kVV/0Qt7tBesnc=
-github.com/attestux/protocol-go v0.0.0-20261102143929-cf69bfca3250/go.mod h1:UY4RB/npwyRpKdEw03DG3v4Wt8DbbpqLPCqI+9d5aMs=
+github.com/attestux/protocol-go v0.0.0-20261111204932-602a8b79b91b h1:fGHoj0O8Dh20TXKTXPF5XAhe0BahZ919LymxLlG8O88=
+github.com/attestux/protocol-go v0.0.0-20261111204932-602a8b79b91b/go.mod h1:0TNceie+RSAd78fWNze00hur4Ova2UoGs8eIDa6DKws=
 github.com/google/go-attestation v0.6.4 h1:FtzlaC+MNJuSjZzM3LREPIs1llTlIsfU/+d4Jsb/cW4=
 github.com/google/go-attestation v0.6.4/go.mod h1:ET/zuOTCIOxdpqep6KZ7kV614DmI41f8HWMYq8pEupc=
 github.com/google/go-cmdtest v0.4.1-0.20220921163831-55ab3332a786 h1:rcv+Ippz6RAtvaGgKxc+8FQIpxHgsF+HBzPyYL2cyVU=
