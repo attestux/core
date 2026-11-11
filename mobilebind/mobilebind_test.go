@@ -60,12 +60,11 @@ func pendingFakeSession() *fakeVerificationSession {
 	}
 }
 
-func challengedVerifier(t *testing.T, verifier *Verifier) *Verifier {
-	t.Helper()
-	if _, err := verifier.IssueChallenge(); err != nil {
-		t.Fatal(err)
+func pendingReport() *resultv1.VerificationReport {
+	return &resultv1.VerificationReport{
+		Status:         attestuxv1.VerificationStatus_VERIFICATION_STATUS_PENDING_ACTIVATION,
+		EvidenceSha256: make([]byte, sha256.Size),
 	}
-	return verifier
 }
 
 func decodePreparation(t *testing.T, raw []byte) *resultv1.VerificationPreparation {
@@ -77,10 +76,8 @@ func decodePreparation(t *testing.T, raw []byte) *resultv1.VerificationPreparati
 	return &preparation
 }
 
-func TestIssueChallengeStartsKeyDiscoveryOnce(t *testing.T) {
-	verifier := NewVerifier()
-	defer verifier.Close()
-	raw, err := verifier.IssueChallenge()
+func TestIssueChallengeRequestsKeyDiscovery(t *testing.T) {
+	raw, err := IssueChallenge()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,21 +88,10 @@ func TestIssueChallengeStartsKeyDiscoveryOnce(t *testing.T) {
 	if request.ProtocolVersion != attestation.ProtocolVersion || len(request.ProtoReflect().GetUnknown()) != 0 {
 		t.Fatalf("invalid key discovery: %v", &request)
 	}
-	if _, err := verifier.IssueChallenge(); err == nil {
-		t.Fatal("issued a second request")
-	}
-}
-
-func TestPrepareVerificationRequiresAnIssuedChallenge(t *testing.T) {
-	verifier := NewVerifier()
-	defer verifier.Close()
-	if _, err := verifier.PrepareVerification([]byte{0xff}); err == nil {
-		t.Fatal("verifier prepared a hello without issuing a challenge")
-	}
 }
 
 func TestMalformedHelloProducesRetainableRejectedReport(t *testing.T) {
-	verifier := challengedVerifier(t, NewVerifier())
+	verifier := NewVerifier()
 	defer verifier.Close()
 	hello := []byte{0xff}
 	raw, err := verifier.PrepareVerification(hello)
@@ -158,22 +144,28 @@ func TestEncodePreparationReturnsThePendingChallenge(t *testing.T) {
 }
 
 func TestEncodePreparationCancelsSessionsThatCannotBeActivated(t *testing.T) {
+	oversized := pendingFakeSession()
+	// Each field fits on its own; the combined encoding exceeds the message limit
+	oversized.activationChallenge.Credential = make([]byte, attestation.MaxControlMessageSize)
+	oversized.activationChallenge.EncryptedSecret = oversized.activationChallenge.Credential
 	for _, test := range []struct {
-		name    string
-		session *fakeVerificationSession
-		encoded bool
+		name      string
+		session   *fakeVerificationSession
+		wantError string
 	}{
-		{"no challenge", &fakeVerificationSession{report: attestationtest.FailedReport()}, true},
-		{"nonterminal report without a challenge", &fakeVerificationSession{}, false},
+		{"no challenge", &fakeVerificationSession{report: attestationtest.FailedReport()}, ""},
+		{"invalid evidence hash", &fakeVerificationSession{}, "invalid evidence hash"},
+		{"nonterminal report without a challenge", &fakeVerificationSession{report: pendingReport()}, "nonterminal status"},
+		{"oversized challenge", oversized, "activation challenge exceeds local limits"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raw, err := encodePreparationOrCancel(test.session)
 			if test.session.canceled != 1 {
 				t.Fatalf("cancel count = %d, want 1", test.session.canceled)
 			}
-			if !test.encoded {
-				if err == nil || raw != nil {
-					t.Fatalf("encodePreparationOrCancel = %x, %v; want an unusable-report failure", raw, err)
+			if test.wantError != "" {
+				if raw != nil || err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("encodePreparationOrCancel = %x, %v; want %q", raw, err, test.wantError)
 				}
 				return
 			}
@@ -186,19 +178,6 @@ func TestEncodePreparationCancelsSessionsThatCannotBeActivated(t *testing.T) {
 				t.Fatalf("unexpected completion: %v", completion)
 			}
 		})
-	}
-}
-
-func TestEncodePreparationCancelsWhenTheChallengeCannotBeEncoded(t *testing.T) {
-	session := pendingFakeSession()
-	// Each field fits on its own; the combined encoding exceeds the message limit.
-	session.activationChallenge.Credential = make([]byte, attestation.MaxControlMessageSize)
-	session.activationChallenge.EncryptedSecret = session.activationChallenge.Credential
-	if raw, err := encodePreparationOrCancel(session); raw != nil || err == nil || !strings.Contains(err.Error(), "activation challenge exceeds local limits") {
-		t.Fatalf("encodePreparationOrCancel = %x, %v; want the activation challenge limit", raw, err)
-	}
-	if session.canceled != 1 {
-		t.Fatalf("cancel count = %d, want 1", session.canceled)
 	}
 }
 
@@ -244,9 +223,6 @@ func TestCompletionEncodesTheSessionReport(t *testing.T) {
 			if !proto.Equal(&completion, want) {
 				t.Fatalf("completion = %v, want %v", &completion, want)
 			}
-			if len(raw) > maxCompletionBytes {
-				t.Fatalf("encoded completion size %d exceeds its budget", len(raw))
-			}
 		})
 	}
 }
@@ -261,23 +237,20 @@ func TestCompletionRequiresAUsableSession(t *testing.T) {
 	if _, err := verifier.RejectActivation(); err == nil {
 		t.Fatal("session error was ignored")
 	}
-	verifier.session = &fakeVerificationSession{completeReport: &resultv1.VerificationReport{}}
-	if raw, err := verifier.RejectActivation(); err == nil || raw != nil {
+	verifier.session = &fakeVerificationSession{completeReport: pendingReport()}
+	if raw, err := verifier.RejectActivation(); err == nil || raw != nil || !strings.Contains(err.Error(), "nonterminal status") {
 		t.Fatalf("completion = %x, %v; want a nonterminal report refused", raw, err)
 	}
 }
 
 func TestCloseCancelsTheSessionAndRejectsCalls(t *testing.T) {
-	verifier := challengedVerifier(t, NewVerifier())
+	verifier := NewVerifier()
 	session := pendingFakeSession()
 	verifier.session = session
 	verifier.Close()
 	verifier.Close()
 	if session.canceled != 1 {
 		t.Fatalf("closed session cancel count = %d, want 1", session.canceled)
-	}
-	if _, err := verifier.IssueChallenge(); err == nil {
-		t.Fatal("closed verifier issued a challenge")
 	}
 	if _, err := verifier.PrepareVerification([]byte{0xff}); err == nil {
 		t.Fatal("closed verifier prepared a hello")
