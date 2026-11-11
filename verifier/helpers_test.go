@@ -33,7 +33,7 @@ func marshalEvidence(t testing.TB, evidence *attestuxv1.AttestationEvidence) []b
 
 func marshalHello(t testing.TB, keys *attestuxv1.AttestationKeys) []byte {
 	t.Helper()
-	raw, err := proto.Marshal(&attestuxv1.AttestationHello{Keys: keys})
+	raw, err := proto.Marshal(&attestuxv1.AttestationHello{Keys: keys, ProverNonce: bytes.Repeat([]byte{7}, attestation.ProverNonceSize)})
 	if err != nil {
 		t.Fatal(err)
 	}

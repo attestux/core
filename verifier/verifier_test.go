@@ -83,6 +83,38 @@ func TestPrepareVerificationRejectsEmptyHello(t *testing.T) {
 	}
 }
 
+func TestPrepareVerificationRejectsMissingOrMalformedProverNonce(t *testing.T) {
+	for _, size := range []int{0, 1, attestation.ProverNonceSize - 1, attestation.ProverNonceSize + 1} {
+		hello := &attestuxv1.AttestationHello{
+			Keys: attestationtest.MinimallyShapedEvidence().Keys, ProverNonce: make([]byte, size),
+		}
+		raw, err := proto.Marshal(hello)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session := PrepareVerification(raw)
+		report := session.Report()
+		if session.ActivationChallenge() != nil || report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
+			!containsMessage(report.Errors, "prover nonce must be 32 bytes") || describesTrust(report) {
+			t.Fatalf("nonce size %d accepted or misreported: %v", size, report)
+		}
+	}
+}
+
+func TestActivationChallengeEchoesTheProverNonceWithoutSharingItsBuffer(t *testing.T) {
+	session, _, _ := newQuoteTestSession(t)
+	defer session.Cancel()
+	challenge := session.ActivationChallenge()
+	want := bytes.Repeat([]byte{7}, attestation.ProverNonceSize)
+	if !bytes.Equal(challenge.ProverNonce, want) {
+		t.Fatal("activation challenge did not echo the hello nonce")
+	}
+	clear(challenge.ProverNonce)
+	if !bytes.Equal(session.ActivationChallenge().ProverNonce, want) {
+		t.Fatal("caller changed the retained activation's public nonce")
+	}
+}
+
 func TestPrepareVerificationHelloSizeBoundary(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	evidence := softwareEvidenceWithFixture(t, fixture, nil)
@@ -129,7 +161,7 @@ func TestPrepareVerificationHelloSizeBoundary(t *testing.T) {
 
 func TestPrepareVerificationRejectsHelloWithoutKeys(t *testing.T) {
 	// A future optional field makes the hello nonempty without supplying keys.
-	raw := []byte{0x12, 1, 0x55}
+	raw := protowire.AppendBytes(protowire.AppendTag(nil, 100, protowire.BytesType), []byte{0x55})
 	session := PrepareVerification(raw)
 	report := session.Report()
 	if session.ActivationChallenge() != nil || report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||

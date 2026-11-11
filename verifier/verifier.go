@@ -93,6 +93,8 @@ func prepareVerificationWithPolicies(
 		failReport(report, "malformed attestation hello: %v", err)
 	} else if err := attestation.ValidateKeys(hello.Keys); err != nil {
 		failReport(report, "%v", err)
+	} else if len(hello.ProverNonce) != attestation.ProverNonceSize {
+		failReport(report, "malformed attestation hello: prover nonce must be %d bytes", attestation.ProverNonceSize)
 	}
 	if len(report.Errors) != 0 {
 		return session
@@ -160,6 +162,7 @@ func prepareVerificationWithPolicies(
 		EndorsementKeySha256: bytes.Clone(endorsement.publicSHA256),
 		Credential:           bytes.Clone(encrypted.Credential),
 		EncryptedSecret:      bytes.Clone(encrypted.Secret),
+		ProverNonce:          bytes.Clone(hello.ProverNonce),
 	}
 	return session
 }
