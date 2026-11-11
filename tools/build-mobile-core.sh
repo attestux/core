@@ -26,7 +26,7 @@ mkdir -p "$(dirname "${aar}")"
 bind_arguments=(
 	"-target=android/arm,android/arm64"
 	-androidapi=23
-	-javapkg=dev.attestux.nativecore
+	-javapkg=com.attestux.androidcore
 	-trimpath
 )
 if "${simulator}"; then
