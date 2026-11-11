@@ -111,7 +111,7 @@ func TestCompletionForReportOversized(t *testing.T) {
 		EndorsementKeySha256: make([]byte, sha256.Size),
 		TrustPolicy:          attestuxv1.TrustPolicy_TRUST_POLICY_NUVOTON,
 		Limitations:          []string{"certificate revocation is not checked"},
-		Warnings:             []string{strings.Repeat("w", MaxReportSize)},
+		Warnings:             []string{strings.Repeat("w", maxReportSize)},
 		Events:               []*resultv1.Event{{}, {}},
 		OmittedEventCount:    3,
 	}
@@ -120,8 +120,8 @@ func TestCompletionForReportOversized(t *testing.T) {
 		t.Fatal(err)
 	}
 	rejected := completion.Report
-	if size := proto.Size(rejected); size > MaxReportSize {
-		t.Fatalf("rejected report size = %d, want at most %d", size, MaxReportSize)
+	if size := proto.Size(rejected); size > maxReportSize {
+		t.Fatalf("rejected report size = %d, want at most %d", size, maxReportSize)
 	}
 	if rejected.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
 		rejected.DeviceId != "device" ||

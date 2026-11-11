@@ -20,7 +20,7 @@ func CompletionForReport(
 	if report == nil {
 		return nil, errors.New("verification completion is missing a report")
 	}
-	if proto.Size(report) > MaxReportSize {
+	if proto.Size(report) > maxReportSize {
 		report = rejectOversizedReport(report)
 	} else {
 		report = proto.Clone(report).(*resultv1.VerificationReport)

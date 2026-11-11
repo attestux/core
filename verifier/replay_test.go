@@ -313,8 +313,8 @@ func TestReplayEventLogBudget(t *testing.T) {
 		EventLogIncomplete: replay.incomplete,
 		OmittedEventCount:  replay.omittedEventCount,
 	}
-	if size := proto.Size(report); size > MaxReportSize {
-		t.Fatalf("production-normalized report is %d bytes, limit is %d", size, MaxReportSize)
+	if size := proto.Size(report); size > maxReportSize {
+		t.Fatalf("production-normalized report is %d bytes, limit is %d", size, maxReportSize)
 	}
 }
 

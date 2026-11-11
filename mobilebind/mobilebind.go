@@ -25,7 +25,6 @@ type verificationSession interface {
 // Verifier owns one activation session. Create and close one for each Android channel.
 type Verifier struct {
 	mu      sync.Mutex
-	issued  bool
 	session verificationSession
 	closed  bool
 }
@@ -34,23 +33,9 @@ func NewVerifier() *Verifier {
 	return &Verifier{}
 }
 
-// Begin key discovery; the secret challenge is generated after key validation.
-func (v *Verifier) IssueChallenge() ([]byte, error) {
-	challenge := attestation.NewChallenge()
-	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(challenge)
-	if err != nil {
-		return nil, err
-	}
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.closed {
-		return nil, errors.New("verifier is closed")
-	}
-	if v.issued {
-		return nil, errors.New("verifier has already issued an attestation challenge")
-	}
-	v.issued = true
-	return raw, nil
+// IssueChallenge encodes public key discovery; its secret challenge follows key validation
+func IssueChallenge() ([]byte, error) {
+	return proto.MarshalOptions{Deterministic: true}.Marshal(attestation.NewChallenge())
 }
 
 // PrepareVerification checks an encoded AttestationHello and returns an encrypted
@@ -64,9 +49,6 @@ func (v *Verifier) PrepareVerification(hello []byte) ([]byte, error) {
 	}
 	if v.session != nil {
 		return nil, errors.New("verifier has already been used")
-	}
-	if !v.issued {
-		return nil, errors.New("verifier has not issued an attestation challenge")
 	}
 	session := verifier.PrepareVerification(hello)
 	v.session = session
