@@ -30,7 +30,7 @@ type endorsementCertificateFixture struct {
 	leafTemplate x509.Certificate
 }
 
-func TestValidateEndorsementsWithTrustAcceptsTheTCGSubjectAltName(t *testing.T) {
+func TestValidateEndorsementWithTrustAcceptsTheTCGSubjectAltName(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	candidate := fixture.issue(t, 2, nil)
 	parsedLeaf, err := x509.ParseCertificate(candidate.Certificate)
@@ -51,8 +51,8 @@ func TestValidateEndorsementsWithTrustAcceptsTheTCGSubjectAltName(t *testing.T) 
 		t.Fatal("fixture certificate lacks the unhandled critical SAN this test relies on")
 	}
 
-	validated, err := validateEndorsementsWithTrust(
-		[]*attestuxv1.EndorsementKey{candidate},
+	validated, err := validateEndorsementWithTrust(
+		candidate,
 		certificateTrust{roots: fixture.roots},
 		fixture.now,
 	)
@@ -65,26 +65,26 @@ func TestValidateEndorsementsWithTrustAcceptsTheTCGSubjectAltName(t *testing.T) 
 	}
 }
 
-func TestValidateEndorsementsWithTrustRequiresACandidate(t *testing.T) {
+func TestSelectEndorsementPolicyRequiresACandidate(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	for want, candidates := range map[string][]*attestuxv1.EndorsementKey{
 		"no endorsement-key certificate supplied": nil,
 		"missing endorsement key":                 {nil},
 	} {
-		validated, err := validateEndorsementsWithTrust(candidates, certificateTrust{roots: fixture.roots}, fixture.now)
+		validated, _, err := selectEndorsementPolicy(candidates, []verificationPolicy{fixture.policy()}, fixture.now)
 		if validated != nil || err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("candidates %v returned %v, %v; want %q", candidates, validated, err, want)
 		}
 	}
 }
 
-func TestValidateEndorsementsWithTrustAcceptsANonCriticalSubjectAltName(t *testing.T) {
+func TestValidateEndorsementWithTrustAcceptsANonCriticalSubjectAltName(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	candidate := fixture.issue(t, 4, func(template *x509.Certificate) {
 		template.ExtraExtensions[0].Critical = false
 	})
-	if _, err := validateEndorsementsWithTrust(
-		[]*attestuxv1.EndorsementKey{candidate},
+	if _, err := validateEndorsementWithTrust(
+		candidate,
 		certificateTrust{roots: fixture.roots},
 		fixture.now,
 	); err != nil {
@@ -92,7 +92,7 @@ func TestValidateEndorsementsWithTrustAcceptsANonCriticalSubjectAltName(t *testi
 	}
 }
 
-func TestValidateEndorsementsWithTrustThroughIntermediate(t *testing.T) {
+func TestValidateEndorsementWithTrustThroughIntermediate(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	intermediateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -137,8 +137,8 @@ func TestValidateEndorsementsWithTrustThroughIntermediate(t *testing.T) {
 	candidate := &attestuxv1.EndorsementKey{
 		Certificate: leafDER,
 	}
-	if _, err := validateEndorsementsWithTrust(
-		[]*attestuxv1.EndorsementKey{candidate},
+	if _, err := validateEndorsementWithTrust(
+		candidate,
 		certificateTrust{roots: fixture.roots},
 		fixture.now,
 	); err == nil || !strings.Contains(err.Error(), "unknown authority") {
@@ -147,8 +147,8 @@ func TestValidateEndorsementsWithTrustThroughIntermediate(t *testing.T) {
 
 	intermediates := x509.NewCertPool()
 	intermediates.AddCert(intermediate)
-	if _, err := validateEndorsementsWithTrust(
-		[]*attestuxv1.EndorsementKey{candidate},
+	if _, err := validateEndorsementWithTrust(
+		candidate,
 		certificateTrust{
 			roots:         fixture.roots,
 			intermediates: intermediates,
@@ -159,7 +159,7 @@ func TestValidateEndorsementsWithTrustThroughIntermediate(t *testing.T) {
 	}
 }
 
-func TestValidateEndorsementsWithTrustRejectsInvalidCertificates(t *testing.T) {
+func TestValidateEndorsementWithTrustRejectsInvalidCertificates(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	weakKey, err := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
 	if err != nil {
@@ -292,8 +292,8 @@ func TestValidateEndorsementsWithTrustRejectsInvalidCertificates(t *testing.T) {
 			if test.changeCandidate != nil {
 				test.changeCandidate(candidate)
 			}
-			_, err := validateEndorsementsWithTrust(
-				[]*attestuxv1.EndorsementKey{candidate},
+			_, err := validateEndorsementWithTrust(
+				candidate,
 				certificateTrust{roots: fixture.roots},
 				fixture.now,
 			)

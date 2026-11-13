@@ -22,7 +22,8 @@ func requireEventLogExplainsPCR(pcr attest.PCR, verifiedEvents, allEvents []atte
 }
 
 func isInitialPCRValue(pcr attest.PCR, events []attest.Event) bool {
-	if isAllZero(pcr.Digest) {
+	initial := make([]byte, len(pcr.Digest))
+	if bytes.Equal(pcr.Digest, initial) {
 		return true
 	}
 
@@ -35,7 +36,6 @@ func isInitialPCRValue(pcr attest.PCR, events []attest.Event) bool {
 				!bytes.HasPrefix(event.Data, []byte("StartupLocality")) {
 				continue
 			}
-			initial := make([]byte, len(pcr.Digest))
 			initial[len(initial)-1] = event.Data[len(event.Data)-1]
 			if bytes.Equal(pcr.Digest, initial) {
 				return true
@@ -43,15 +43,6 @@ func isInitialPCRValue(pcr attest.PCR, events []attest.Event) bool {
 		}
 	}
 	return false
-}
-
-func isAllZero(value []byte) bool {
-	for _, got := range value {
-		if got != 0 {
-			return false
-		}
-	}
-	return len(value) > 0
 }
 
 // EV_NO_ACTION entries are informational and never extend a PCR.
@@ -77,7 +68,7 @@ func normalizeEvent(e attest.Event, sequence uint32) *resultv1.Event {
 		PcrIndex:      uint32(e.Index),
 		EventType:     uint32(e.Type),
 		EventTypeName: e.Type.String(),
-		Data:          bytes.Clone(e.Data),
+		Data:          e.Data,
 		Decoded:       formatEventData(e.Data),
 	}
 }

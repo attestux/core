@@ -1,7 +1,6 @@
 package verifier
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/subtle"
 	"errors"
@@ -20,58 +19,58 @@ import (
 func verifyQuotedPCRs(
 	e *attestuxv1.AttestationEvidence,
 	expectedNonce []byte,
-) ([]attest.PCR, []*resultv1.PcrResult, error) {
+) ([]*resultv1.PcrResult, error) {
 	ak, err := attest.ParseAKPublic(
 		e.Keys.AttestationPublic,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse attestation public key: %w", err)
+		return nil, fmt.Errorf("parse attestation public key: %w", err)
 	}
 	bank := sha256PCRBank(e)
 	quote := attest.Quote{
-		Quote:     bytes.Clone(bank.Quote.Quote),
-		Signature: bytes.Clone(bank.Quote.Signature),
+		Quote:     bank.Quote.Quote,
+		Signature: bank.Quote.Signature,
 	}
 	if err := attestation.RequireSHA256SignatureEncoding(quote.Signature); err != nil {
-		return nil, nil, fmt.Errorf("verify TPM quote: %w", err)
+		return nil, fmt.Errorf("verify TPM quote: %w", err)
 	}
 
 	pcrs := make([]attest.PCR, 0, len(bank.Pcrs))
-	results := make([]*resultv1.PcrResult, 0, len(bank.Pcrs))
 	for _, pcr := range bank.Pcrs {
 		pcrs = append(pcrs, attest.PCR{
 			Index:     int(pcr.Index),
-			Digest:    bytes.Clone(pcr.Digest),
+			Digest:    pcr.Digest,
 			DigestAlg: crypto.SHA256,
-		})
-		results = append(results, &resultv1.PcrResult{
-			HashAlgorithm: attestation.TPMAlgSHA256,
-			Pcr:           &attestuxv1.Pcr{Index: pcr.Index, Digest: bytes.Clone(pcr.Digest)},
 		})
 	}
 
 	decoded, err := tpm2.DecodeAttestationData(quote.Quote)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse TPM quote: %w", err)
+		return nil, fmt.Errorf("parse TPM quote: %w", err)
 	}
 	// The library includes its nonce argument in mismatch errors. Give it only
 	// the public quote nonce, then check the private challenge ourselves.
 	if err := ak.Verify(quote, pcrs, decoded.ExtraData); err != nil {
-		return nil, nil, fmt.Errorf("verify TPM quote: %w", err)
+		return nil, fmt.Errorf("verify TPM quote: %w", err)
 	}
 	if subtle.ConstantTimeCompare(decoded.ExtraData, expectedNonce) != 1 {
-		return nil, nil, errors.New("verify TPM quote: nonce mismatch")
+		return nil, errors.New("verify TPM quote: nonce mismatch")
 	}
 	// The library can accept a quote for another bank without covering any of these PCRs.
+	results := make([]*resultv1.PcrResult, 0, len(pcrs))
 	for _, pcr := range pcrs {
 		if !pcr.QuoteVerified() {
-			return nil, nil, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"verify TPM quote: quote does not cover SHA-256 PCR %d",
 				pcr.Index,
 			)
 		}
+		results = append(results, &resultv1.PcrResult{
+			HashAlgorithm: attestation.TPMAlgSHA256,
+			Pcr:           &attestuxv1.Pcr{Index: uint32(pcr.Index), Digest: pcr.Digest},
+		})
 	}
-	return pcrs, results, nil
+	return results, nil
 }
 
 func sha256PCRBank(e *attestuxv1.AttestationEvidence) *attestuxv1.PcrBankEvidence {

@@ -1,7 +1,6 @@
 package verifier
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -52,6 +51,9 @@ func selectEndorsementPolicy(
 			"no endorsement certificate trust policy is configured",
 		)
 	}
+	if len(keys) == 0 {
+		return nil, verificationPolicy{}, errors.New("no endorsement-key certificate supplied")
+	}
 	var failures []error
 	for _, policy := range policies {
 		name, recognized := attestation.TrustPolicyName(policy.id)
@@ -63,11 +65,13 @@ func selectEndorsementPolicy(
 			)
 			continue
 		}
-		endorsement, err := validateEndorsementsWithTrust(keys, policy.trust, now)
-		if err == nil {
-			return endorsement, policy, nil
+		for index, candidate := range keys {
+			endorsement, err := validateEndorsementWithTrust(candidate, policy.trust, now)
+			if err == nil {
+				return endorsement, policy, nil
+			}
+			failures = append(failures, fmt.Errorf("%s: EK certificate %d: %w", name, index, err))
 		}
-		failures = append(failures, fmt.Errorf("%s: %w", name, err))
 	}
 	return nil, verificationPolicy{}, errors.Join(failures...)
 }
@@ -126,30 +130,21 @@ func prepareVerificationWithPolicies(
 	}
 	// Don't name the policy or EK until activation ties them to the AK.
 	session.policy = policy
-	session.endorsementKeySHA256 = bytes.Clone(endorsement.publicSHA256)
+	session.endorsementKeySHA256 = endorsement.publicSHA256
 	activation := attest.ActivationParameters{
 		EK: endorsement.publicKey,
 		AK: attest.AttestationParameters{
-			Public:            bytes.Clone(keys.AttestationPublic),
-			CreateData:        bytes.Clone(keys.AkCreateData),
-			CreateAttestation: bytes.Clone(keys.AkCreateAttestation),
-			CreateSignature:   bytes.Clone(keys.AkCreateSignature),
+			Public:            keys.AttestationPublic,
+			CreateData:        keys.AkCreateData,
+			CreateAttestation: keys.AkCreateAttestation,
+			CreateSignature:   keys.AkCreateSignature,
 		},
-	}
-	// Check AK creation on its own so we can tell AK and EK failures apart.
-	if err := activation.CheckAKParameters(); err != nil {
-		failReport(
-			report,
-			"attestation key is not TPM-created: %v",
-			err,
-		)
-		return session
 	}
 	secret, encrypted, err := activation.Generate()
 	if err != nil {
 		failReport(
 			report,
-			"build credential activation challenge for the certified endorsement key: %v",
+			"attestation key validation or activation setup failed: %v",
 			err,
 		)
 		return session
@@ -159,10 +154,10 @@ func prepareVerificationWithPolicies(
 	session.keys = keys
 	session.deviceID = deviceID
 	session.activationChallenge = &attestuxv1.CredentialActivationChallenge{
-		EndorsementKeySha256: bytes.Clone(endorsement.publicSHA256),
-		Credential:           bytes.Clone(encrypted.Credential),
-		EncryptedSecret:      bytes.Clone(encrypted.Secret),
-		ProverNonce:          bytes.Clone(hello.ProverNonce),
+		EndorsementKeySha256: endorsement.publicSHA256,
+		Credential:           encrypted.Credential,
+		EncryptedSecret:      encrypted.Secret,
+		ProverNonce:          hello.ProverNonce,
 	}
 	return session
 }
@@ -224,7 +219,7 @@ func (s *VerificationSession) completeEvidence(evidenceBytes []byte, failure str
 	} else if !proto.Equal(evidence.Keys, s.keys) {
 		failReport(report, "evidence keys do not match the credential activation challenge")
 	} else {
-		pcrs, pcrResults, err := verifyQuotedPCRs(&evidence, s.expectedQuoteNonce)
+		pcrResults, err := verifyQuotedPCRs(&evidence, s.expectedQuoteNonce)
 		if err != nil {
 			failReport(report, "%v", err)
 		} else {
@@ -233,10 +228,10 @@ func (s *VerificationSession) completeEvidence(evidenceBytes []byte, failure str
 			if warning := unsupportedPCRBankWarning(&evidence); warning != "" {
 				report.Warnings = append(report.Warnings, warning)
 			}
-			attachEventLogReplay(report, evidence.EventLog, pcrs)
+			attachEventLogReplay(report, evidence.EventLog)
 			report.Status = attestuxv1.VerificationStatus_VERIFICATION_STATUS_VERIFIED
 			report.TrustPolicy = s.policy.id
-			report.EndorsementKeySha256 = bytes.Clone(s.endorsementKeySHA256)
+			report.EndorsementKeySha256 = s.endorsementKeySHA256
 			if s.policy.limitation != "" {
 				report.Limitations = slices.Insert(report.Limitations, 0, s.policy.limitation)
 			}
@@ -272,9 +267,8 @@ func diagnostic(format string, args ...any) string {
 func attachEventLogReplay(
 	report *resultv1.VerificationReport,
 	eventLog []byte,
-	pcrs []attest.PCR,
 ) {
-	replay := replayEventLog(eventLog, pcrs, report.Pcrs, maxNormalizedEventBytes)
+	replay := replayEventLog(eventLog, report.Pcrs)
 	report.Events = replay.events
 	report.EventLogIncomplete = replay.incomplete
 	report.OmittedEventCount = replay.omittedEventCount
