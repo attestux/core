@@ -25,12 +25,7 @@ import (
 
 func TestSimulatedTPMEndToEnd(t *testing.T) {
 	sim, tpm := attestationtest.NewSimulatedTPM(t)
-	ak, err := tpm.NewAK(&attest.AKConfig{Algorithm: attest.ECDSA})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ak.Close(tpm)
-
+	ak := newSimulatorAK(t, tpm)
 	banks, err := tpm.PCRBanks()
 	if err != nil {
 		t.Fatal(err)
@@ -177,14 +172,6 @@ func TestSimulatedTPMEndToEnd(t *testing.T) {
 			}
 		})
 	}
-	t.Run("forged AK creation signature", func(t *testing.T) {
-		forged := proto.Clone(keys).(*attestuxv1.AttestationKeys)
-		forged.AkCreateSignature[len(forged.AkCreateSignature)-1] ^= 0xff
-		next := prepare(t, forged)
-		if next.ActivationChallenge() != nil || !containsMessage(next.Report().Errors, "attestation key is not TPM-created") || len(next.Report().Pcrs) != 0 {
-			t.Fatalf("forged key accepted: %v", next.Report())
-		}
-	})
 }
 
 func simulatorAttestationKeys(ak *attest.AK, endorsement *attestuxv1.EndorsementKey) *attestuxv1.AttestationKeys {

@@ -1,7 +1,7 @@
 package verifier
 
 import (
-	"bytes"
+	"crypto"
 	"slices"
 
 	"github.com/attestux/core/attestation"
@@ -20,9 +20,7 @@ type eventLogReplay struct {
 
 func replayEventLog(
 	raw []byte,
-	pcrs []attest.PCR,
 	pcrResults []*resultv1.PcrResult,
-	normalizedBudget int,
 ) eventLogReplay {
 	eventLog, err := attest.ParseEventLog(raw)
 	if err != nil {
@@ -57,14 +55,9 @@ func replayEventLog(
 		)
 	}
 
-	replay := replayAttestedPCRs(eventLog, pcrs, allEvents, pcrResults, warn)
+	replay := replayAttestedPCRs(eventLog, allEvents, pcrResults, warn)
 	algorithms := alignEventsByAlgorithm(eventLog, allEvents)
-	events := normalizeEventsWithinBudget(
-		allEvents,
-		algorithms,
-		replay,
-		normalizedBudget,
-	)
+	events := normalizeEventsWithinBudget(allEvents, algorithms, replay)
 
 	omitted := len(allEvents) - len(events)
 	if omitted > 0 {
@@ -87,13 +80,17 @@ type pcrReplay map[int]resultv1.ReplayState
 
 func replayAttestedPCRs(
 	eventLog *attest.EventLog,
-	pcrs []attest.PCR,
 	allEvents []attest.Event,
 	pcrResults []*resultv1.PcrResult,
 	warn func(string, ...any),
 ) pcrReplay {
-	replay := make(pcrReplay, len(pcrs))
-	for _, pcr := range pcrs {
+	replay := make(pcrReplay, len(pcrResults))
+	for _, result := range pcrResults {
+		pcr := attest.PCR{
+			Index:     int(result.Pcr.Index),
+			Digest:    result.Pcr.Digest,
+			DigestAlg: crypto.SHA256,
+		}
 		verifiedEvents, replayErr := eventLog.Verify(
 			[]attest.PCR{pcr},
 		)
@@ -120,7 +117,9 @@ func replayAttestedPCRs(
 			)
 		}
 		replay[pcr.Index] = resultv1.ReplayState_REPLAY_STATE_VERIFIED
-		setPCRReplayed(pcrResults, pcr.Index, len(verifiedEvents), unlogged > 0)
+		result.EventLogReplayed = true
+		result.ReplayedEventCount = uint32(len(verifiedEvents))
+		result.ReplayUsedUnloggedEvents = unlogged > 0
 	}
 	return replay
 }
@@ -174,7 +173,6 @@ func normalizeEventsWithinBudget(
 	allEvents []attest.Event,
 	algorithms []algorithmEvents,
 	replay pcrReplay,
-	budget int,
 ) []*resultv1.Event {
 	// Allow room for the parent field tag and length prefix.
 	const repeatedMessageOverhead = 6
@@ -190,37 +188,20 @@ func normalizeEventsWithinBudget(
 			event.Digests = append(
 				event.Digests,
 				&resultv1.EventDigest{
-					Digest:        bytes.Clone(digested.Digest),
+					Digest:        digested.Digest,
 					State:         replay.classifyEvent(algorithm.id, digested),
 					HashAlgorithm: algorithm.id,
 				},
 			)
 		}
 		contribution := proto.Size(event) + repeatedMessageOverhead
-		if size+contribution > budget {
+		if size+contribution > maxNormalizedEventBytes {
 			break
 		}
 		normalized = append(normalized, event)
 		size += contribution
 	}
 	return normalized
-}
-
-// Zero events is only valid if the PCR hasn't left its initial value.
-func setPCRReplayed(
-	results []*resultv1.PcrResult,
-	index int,
-	replayedEvents int,
-	usedUnloggedEvents bool,
-) {
-	for _, result := range results {
-		if result.Pcr.Index == uint32(index) {
-			result.EventLogReplayed = true
-			result.ReplayedEventCount = uint32(replayedEvents)
-			result.ReplayUsedUnloggedEvents = usedUnloggedEvents
-			return
-		}
-	}
 }
 
 // Ignore PCRs 16-23. Indices outside the TPM range are malformed.

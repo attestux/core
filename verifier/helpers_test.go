@@ -31,9 +31,11 @@ func marshalEvidence(t testing.TB, evidence *attestuxv1.AttestationEvidence) []b
 	return raw
 }
 
+func testProverNonce() []byte { return bytes.Repeat([]byte{7}, attestation.ProverNonceSize) }
+
 func marshalHello(t testing.TB, keys *attestuxv1.AttestationKeys) []byte {
 	t.Helper()
-	raw, err := proto.Marshal(&attestuxv1.AttestationHello{Keys: keys, ProverNonce: bytes.Repeat([]byte{7}, attestation.ProverNonceSize)})
+	raw, err := proto.Marshal(&attestuxv1.AttestationHello{Keys: keys, ProverNonce: testProverNonce()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,18 +158,10 @@ func cryptoAgileEventLogHeader(t testing.TB, banks []attest.HashAlg) []byte {
 	return log.Bytes()
 }
 
-func quotedSHA256PCR(index int, events ...logEvent) []attest.PCR {
-	return []attest.PCR{{
-		Index:     index,
-		Digest:    extendedSHA256PCR(events...),
-		DigestAlg: crypto.SHA256,
-	}}
-}
-
-func singlePCRResult(index uint32) []*resultv1.PcrResult {
+func sha256PCRResult(index uint32, events ...logEvent) []*resultv1.PcrResult {
 	return []*resultv1.PcrResult{{
 		HashAlgorithm: attestation.TPMAlgSHA256,
-		Pcr:           &attestuxv1.Pcr{Index: index},
+		Pcr:           &attestuxv1.Pcr{Index: index, Digest: extendedSHA256PCR(events...)},
 	}}
 }
 
