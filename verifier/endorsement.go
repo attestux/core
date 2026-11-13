@@ -21,25 +21,6 @@ type certificateTrust struct {
 	intermediates *x509.CertPool
 }
 
-func validateEndorsementsWithTrust(
-	candidates []*attestuxv1.EndorsementKey,
-	trust certificateTrust,
-	now time.Time,
-) (*validatedEndorsement, error) {
-	var failures []error
-	for index, candidate := range candidates {
-		validated, err := validateEndorsementWithTrust(candidate, trust, now)
-		if err == nil {
-			return validated, nil
-		}
-		failures = append(failures, fmt.Errorf("EK certificate %d: %w", index, err))
-	}
-	if len(failures) == 0 {
-		return nil, errors.New("no endorsement-key certificate supplied")
-	}
-	return nil, errors.Join(failures...)
-}
-
 func validateEndorsementWithTrust(
 	candidate *attestuxv1.EndorsementKey,
 	trust certificateTrust,

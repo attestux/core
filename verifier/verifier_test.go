@@ -105,7 +105,7 @@ func TestActivationChallengeProverNonce(t *testing.T) {
 	session, _, _ := newQuoteTestSession(t)
 	defer session.Cancel()
 	challenge := session.ActivationChallenge()
-	want := bytes.Repeat([]byte{7}, attestation.ProverNonceSize)
+	want := testProverNonce()
 	if !bytes.Equal(challenge.ProverNonce, want) {
 		t.Fatal("activation challenge did not echo the hello nonce")
 	}
@@ -255,25 +255,6 @@ func TestKeepAttestedPCREvents(t *testing.T) {
 	}
 	if invalid != 2 {
 		t.Fatalf("invalid event count = %d, want 2", invalid)
-	}
-}
-
-func TestSetPCRReplayed(t *testing.T) {
-	results := []*resultv1.PcrResult{
-		{HashAlgorithm: attestation.TPMAlgSHA256, Pcr: &attestuxv1.Pcr{Index: 5}},
-		{HashAlgorithm: attestation.TPMAlgSHA256, Pcr: &attestuxv1.Pcr{Index: 7}},
-	}
-	setPCRReplayed(results, 7, 3, true)
-	if results[0].EventLogReplayed || !results[1].EventLogReplayed {
-		t.Fatalf("replay result = %#v", results)
-	}
-	if results[0].ReplayedEventCount != 0 ||
-		results[1].ReplayedEventCount != 3 {
-		t.Fatalf("replay count = %#v", results)
-	}
-	if results[0].ReplayUsedUnloggedEvents ||
-		!results[1].ReplayUsedUnloggedEvents {
-		t.Fatalf("replay workaround = %#v", results)
 	}
 }
 
@@ -438,35 +419,36 @@ func TestPrepareVerificationUntrustedKeys(t *testing.T) {
 			change: func(_ testing.TB, _ *softwareAK, e *attestuxv1.AttestationEvidence) {
 				e.Keys.AkCreateSignature[len(e.Keys.AkCreateSignature)-1] ^= 0xff
 			},
-			wantError: "attestation key is not TPM-created",
+			wantError: "attestation key validation or activation setup failed: " +
+				"unable to verify attestation for ecdsa credential",
 		},
 		// These attributes stop host-chosen digests and keep the private key in the TPM.
 		{
 			name:       "AK not restricted",
 			attributes: legacytpm2.FlagSignerDefault &^ legacytpm2.FlagRestricted,
-			wantError:  "attestation key is not TPM-created",
+			wantError:  "provided key is not limited to attestation",
 		},
 		{
 			name:       "AK not fixed to the TPM",
 			attributes: legacytpm2.FlagSignerDefault &^ legacytpm2.FlagFixedTPM,
-			wantError:  "attestation key is not TPM-created",
+			wantError:  "AK is exportable",
 		},
 		{
 			name:       "AK not fixed to its parent",
 			attributes: legacytpm2.FlagSignerDefault &^ legacytpm2.FlagFixedParent,
-			wantError:  "attestation key is not TPM-created",
+			wantError:  "provided key is not limited to attestation",
 		},
 		{
 			name:       "AK sensitive data supplied by the host",
 			attributes: legacytpm2.FlagSignerDefault &^ legacytpm2.FlagSensitiveDataOrigin,
-			wantError:  "attestation key is not TPM-created",
+			wantError:  "provided key is not limited to attestation",
 		},
 		{
 			name: "creation proof for another key",
 			change: func(t testing.TB, ak *softwareAK, e *attestuxv1.AttestationEvidence) {
 				e.Keys.AkCreateAttestation, e.Keys.AkCreateSignature = ak.creationProof(t, newSoftwareAK(t).name(t), e.Keys.AkCreateData)
 			},
-			wantError: "attestation key is not TPM-created",
+			wantError: "creation attestation refers to a different key",
 		},
 		{
 			name: "quote presented as the creation proof",
@@ -475,7 +457,7 @@ func TestPrepareVerificationUntrustedKeys(t *testing.T) {
 				quote := ak.quoteEvidence(t, nil, selection, zeroPCRComposite(selection)).PcrBanks[0].Quote
 				e.Keys.AkCreateAttestation, e.Keys.AkCreateSignature = quote.Quote, quote.Signature
 			},
-			wantError: "attestation key is not TPM-created",
+			wantError: "attestation does not apply to creation data",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -625,4 +607,36 @@ func quoteResponse(t testing.TB, ak *softwareAK, evidence *attestuxv1.Attestatio
 	}
 	out.PcrBanks[0].Quote = ak.quoteEvidence(t, nonce, allAttestedPCRs(), composite.Sum(nil)).PcrBanks[0].Quote
 	return marshalEvidence(t, out)
+}
+
+// The collector may send several EK certificates. Any certified one suffices,
+// and the challenge must name the key that validated, not the first one sent.
+func TestSelectEndorsementPolicyMultipleKeys(t *testing.T) {
+	fixture := newEndorsementCertificateFixture(t)
+	malformed := &attestuxv1.EndorsementKey{Certificate: []byte{0xff}}
+	certified := fixture.issue(t, 2, nil)
+	policies := []verificationPolicy{fixture.policy()}
+	publicSum := sha256.Sum256(fixture.publicDER)
+
+	evidence := softwareEvidenceWithFixture(t, fixture, nil)
+	evidence.Keys.EndorsementKeys = []*attestuxv1.EndorsementKey{malformed, certified}
+	session := prepareVerificationWithPolicies(marshalHello(t, evidence.Keys), policies, fixture.now)
+	t.Cleanup(session.Cancel)
+	if challenge := session.ActivationChallenge(); challenge == nil || !bytes.Equal(challenge.EndorsementKeySha256, publicSum[:]) {
+		t.Fatalf("challenge did not name the certified second candidate: %v", challenge)
+	}
+
+	_, _, err := selectEndorsementPolicy(
+		[]*attestuxv1.EndorsementKey{malformed, malformed},
+		policies,
+		fixture.now,
+	)
+	if err == nil {
+		t.Fatal("two malformed candidates were accepted")
+	}
+	for _, want := range []string{"Nuvoton: EK certificate 0: parse endorsement certificate", "Nuvoton: EK certificate 1: parse endorsement certificate"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("joined failure %q omits %q", err, want)
+		}
+	}
 }

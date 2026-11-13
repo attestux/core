@@ -35,8 +35,8 @@ func TestReplayEventLogMissingDigests(t *testing.T) {
 			log.Write(digest)
 			writeLE(t, &log, uint32(len(event.data)))
 			log.Write(event.data)
-			results := singlePCRResult(7)
-			replay := replayEventLog(log.Bytes(), quotedSHA256PCR(7, event), results, maxNormalizedEventBytes)
+			results := sha256PCRResult(7, event)
+			replay := replayEventLog(log.Bytes(), results)
 
 			if results[0].EventLogReplayed || !containsMessage(replay.warnings, "PCR 7 SHA-256 quote verified, but event-log replay failed") {
 				t.Fatalf("PCR 7 replayed without a SHA-256 digest: %+v, warnings %q", results[0], replay.warnings)
@@ -66,8 +66,8 @@ func TestReplayEventLogDigestAlignment(t *testing.T) {
 		entry(sha256Only, first),
 		entry(bothBanks, second),
 	)
-	results := singlePCRResult(7)
-	replay := replayEventLog(raw, quotedSHA256PCR(7, first, second), results, maxNormalizedEventBytes)
+	results := sha256PCRResult(7, first, second)
+	replay := replayEventLog(raw, results)
 
 	if !results[0].EventLogReplayed || len(replay.events) != 2 {
 		t.Fatalf("PCR 7 result = %+v with %d events, warnings %q", results[0], len(replay.events), replay.warnings)
@@ -101,14 +101,10 @@ func TestReplayEventLogPerPCR(t *testing.T) {
 		data:      []byte("PCR 8 measurement"),
 	}
 	raw := cryptoAgileEventLog(t, banks, append(extended, unexplained)...)
-	pcrs := append(quotedSHA256PCR(7, extended...), attest.PCR{
-		Index:     8,
-		Digest:    bytes.Repeat([]byte{0xa5}, sha256.Size),
-		DigestAlg: crypto.SHA256,
-	})
-	results := append(singlePCRResult(7), singlePCRResult(8)...)
-	replay := replayEventLog(raw, pcrs, results, maxNormalizedEventBytes)
 
+	results := append(sha256PCRResult(7, extended...), sha256PCRResult(8)...)
+	results[1].Pcr.Digest = bytes.Repeat([]byte{0xa5}, sha256.Size)
+	replay := replayEventLog(raw, results)
 	if !results[0].EventLogReplayed || results[0].ReplayedEventCount != 2 {
 		t.Fatalf("PCR 7 result = %+v, want 2 replayed events", results[0])
 	}
@@ -168,10 +164,8 @@ func TestReplayEventLogInitialPCR(t *testing.T) {
 		data:      []byte("PCR 7 measurement"),
 	}
 	raw := cryptoAgileEventLog(t, banks, extended)
-	pcrs := append(quotedSHA256PCR(7, extended), quotedSHA256PCR(9)...)
-	results := append(singlePCRResult(7), singlePCRResult(9)...)
-
-	if replay := replayEventLog(raw, pcrs, results, maxNormalizedEventBytes); len(replay.warnings) != 0 {
+	results := append(sha256PCRResult(7, extended), sha256PCRResult(9)...)
+	if replay := replayEventLog(raw, results); len(replay.warnings) != 0 {
 		t.Fatalf("warnings = %q, want none", replay.warnings)
 	}
 	if !results[1].EventLogReplayed || results[1].ReplayedEventCount != 0 {
@@ -179,9 +173,8 @@ func TestReplayEventLogInitialPCR(t *testing.T) {
 	}
 
 	// The library accepts any PCR value with no events. We require an initial value.
-	pcrs = append(pcrs[:1], quotedSHA256PCR(10, extended)...)
-	results = append(singlePCRResult(7), singlePCRResult(10)...)
-	replay := replayEventLog(raw, pcrs, results, maxNormalizedEventBytes)
+	results = append(sha256PCRResult(7, extended), sha256PCRResult(10, extended)...)
+	replay := replayEventLog(raw, results)
 	if results[1].EventLogReplayed ||
 		!containsMessage(replay.warnings, "no extending event covers non-initial PCR 10") {
 		t.Fatalf("PCR 10 result = %+v, warnings %q; want a coverage failure", results[1], replay.warnings)
@@ -199,9 +192,8 @@ func TestReplayEventLogQuirkWarning(t *testing.T) {
 		{pcrIndex: 5, data: []byte("Exit Boot Services Returned with Success")},
 	}
 	raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, logged)
-	pcrs := quotedSHA256PCR(5, append([]logEvent{logged}, assumed...)...)
-	results := singlePCRResult(5)
-	replay := replayEventLog(raw, pcrs, results, maxNormalizedEventBytes)
+	results := sha256PCRResult(5, append([]logEvent{logged}, assumed...)...)
+	replay := replayEventLog(raw, results)
 
 	if !results[0].EventLogReplayed {
 		t.Fatalf("PCR 5 result = %+v, want the workaround to complete the replay", results[0])
@@ -229,10 +221,10 @@ func TestReplayEventLogNoWarning(t *testing.T) {
 		data:      []byte("logged PCR 5 measurement"),
 	}
 	raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, logged)
-	pcrs := quotedSHA256PCR(5, logged)
-	results := singlePCRResult(5)
 
-	if replay := replayEventLog(raw, pcrs, results, maxNormalizedEventBytes); len(replay.warnings) != 0 {
+	results := sha256PCRResult(5, logged)
+
+	if replay := replayEventLog(raw, results); len(replay.warnings) != 0 {
 		t.Fatalf("warnings = %q, want none", replay.warnings)
 	}
 	if results[0].ReplayUsedUnloggedEvents {
@@ -240,41 +232,28 @@ func TestReplayEventLogNoWarning(t *testing.T) {
 	}
 }
 
-func TestReplayEventLogNormalizationLimit(t *testing.T) {
+func TestReplayEventLogOmittedEvent(t *testing.T) {
 	measurement := logEvent{
 		pcrIndex:  7,
 		eventType: 5,
-		data:      []byte("measurement retained only in raw evidence"),
+		// Raw data fits the budget exactly; protobuf fields and metadata do not.
+		data: bytes.Repeat([]byte{0xa5}, maxNormalizedEventBytes),
 	}
-	raw := cryptoAgileEventLog(
-		t,
-		[]attest.HashAlg{attest.HashSHA256},
-		measurement,
-	)
-	pcrs := quotedSHA256PCR(7, measurement)
-
-	// The raw data fits the second budget, but the encoded event doesn't.
-	for _, budget := range []int{1, len(measurement.data) + 1} {
-		results := singlePCRResult(7)
-		replay := replayEventLog(raw, pcrs, results, budget)
-
-		if len(replay.events) != 0 {
-			t.Fatalf("normalized %d events with a %d-byte budget", len(replay.events), budget)
-		}
-		if !results[0].EventLogReplayed || results[0].ReplayedEventCount != 1 {
-			t.Fatalf("complete event log was not replayed: %+v", results[0])
-		}
-		if replay.omittedEventCount != 1 {
-			t.Fatalf("omitted event count = %d, want 1", replay.omittedEventCount)
-		}
-		if !replay.incomplete {
-			t.Fatal("truncated normalization was not marked incomplete")
-		}
-		if len(replay.warnings) != 1 ||
-			!strings.Contains(replay.warnings[0], "normalized 0 of 1") ||
-			!strings.Contains(replay.warnings[0], "complete log") {
-			t.Fatalf("normalization warning = %q", replay.warnings)
-		}
+	raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, measurement)
+	if len(raw) > attestation.MaxEventLogSize {
+		t.Fatalf("synthetic event log is %d bytes, limit is %d", len(raw), attestation.MaxEventLogSize)
+	}
+	results := sha256PCRResult(7, measurement)
+	replay := replayEventLog(raw, results)
+	if len(replay.events) != 0 || replay.omittedEventCount != 1 || !replay.incomplete {
+		t.Fatalf("normalized %d events, omitted %d, incomplete=%v; want one omitted event", len(replay.events), replay.omittedEventCount, replay.incomplete)
+	}
+	if !results[0].EventLogReplayed || results[0].ReplayedEventCount != 1 {
+		t.Fatalf("complete event log was not replayed: %+v", results[0])
+	}
+	if len(replay.warnings) != 1 || !strings.Contains(replay.warnings[0], "normalized 0 of 1") ||
+		!strings.Contains(replay.warnings[0], "complete log") {
+		t.Fatalf("normalization warning = %q", replay.warnings)
 	}
 }
 
@@ -298,12 +277,17 @@ func TestReplayEventLogBudget(t *testing.T) {
 		t.Fatalf("synthetic event log is %d bytes, limit is %d", len(raw), attestation.MaxEventLogSize)
 	}
 
-	pcrs := quotedSHA256PCR(7, measurements...)
 	pcrResults := attestedPCRResults()
-	replay := replayEventLog(raw, pcrs, pcrResults, maxNormalizedEventBytes)
-
-	if replay.omittedEventCount == 0 || !replay.incomplete {
-		t.Fatal("production normalization budget did not truncate the large log")
+	pcrResults[7].Pcr.Digest = extendedSHA256PCR(measurements...)
+	replay := replayEventLog(raw, pcrResults)
+	omitted := uint32(eventCount - len(replay.events))
+	if omitted == 0 || replay.omittedEventCount != omitted || !replay.incomplete {
+		t.Fatalf("production normalization budget kept %d of %d events, omitted %d, incomplete=%v", len(replay.events), eventCount, replay.omittedEventCount, replay.incomplete)
+	}
+	if len(replay.warnings) != 1 ||
+		!strings.Contains(replay.warnings[0], fmt.Sprintf("normalized %d of %d", len(replay.events), eventCount)) ||
+		!strings.Contains(replay.warnings[0], "complete log") {
+		t.Fatalf("normalization warning = %q", replay.warnings)
 	}
 	if !pcrResults[7].EventLogReplayed ||
 		pcrResults[7].ReplayedEventCount != eventCount {
@@ -350,8 +334,8 @@ func TestReplayEventLogEventLimit(t *testing.T) {
 				measurements[index] = measurement
 			}
 			raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, measurements...)
-			results := singlePCRResult(7)
-			replay := replayEventLog(raw, quotedSHA256PCR(7, measurements...), results, maxNormalizedEventBytes)
+			results := sha256PCRResult(7, measurements...)
+			replay := replayEventLog(raw, results)
 
 			if results[0].EventLogReplayed != test.replayed {
 				t.Fatalf("PCR 7 replayed = %v, want %v", results[0].EventLogReplayed, test.replayed)
@@ -373,8 +357,8 @@ func TestReplayEventLogEventLimit(t *testing.T) {
 
 func TestReplayEventLogParseError(t *testing.T) {
 	header := cryptoAgileEventLogHeader(t, []attest.HashAlg{attest.HashSHA256})
-	results := singlePCRResult(7)
-	replay := replayEventLog(header[:len(header)-1], quotedSHA256PCR(7), results, maxNormalizedEventBytes)
+	results := sha256PCRResult(7)
+	replay := replayEventLog(header[:len(header)-1], results)
 
 	if !replay.incomplete || len(replay.events) != 0 || results[0].EventLogReplayed ||
 		len(replay.warnings) != 1 || !strings.Contains(replay.warnings[0], "event log could not be parsed") {
@@ -390,10 +374,10 @@ func TestReplayEventLogUnattestedPCRs(t *testing.T) {
 		attested,
 		logEvent{pcrIndex: 23, eventType: 5, data: []byte("out of scope")},
 	)
-	pcrs := quotedSHA256PCR(7, attested)
 	pcrResults := attestedPCRResults()
-	replay := replayEventLog(raw, pcrs, pcrResults, maxNormalizedEventBytes)
+	pcrResults[7].Pcr.Digest = extendedSHA256PCR(attested)
 
+	replay := replayEventLog(raw, pcrResults)
 	if replay.incomplete || replay.omittedEventCount != 0 {
 		t.Fatalf(
 			"unattested register reported as an omission: incomplete=%v omitted=%d",
@@ -419,10 +403,10 @@ func TestReplayEventLogInvalidPCRIndex(t *testing.T) {
 		logEvent{pcrIndex: attestation.MaxPCRCount, eventType: 5, data: []byte("invalid")},
 		logEvent{pcrIndex: ^uint32(0), eventType: 5, data: []byte("invalid maximum")},
 	)
-	pcrs := quotedSHA256PCR(7, attested)
 	pcrResults := attestedPCRResults()
-	replay := replayEventLog(raw, pcrs, pcrResults, maxNormalizedEventBytes)
+	pcrResults[7].Pcr.Digest = extendedSHA256PCR(attested)
 
+	replay := replayEventLog(raw, pcrResults)
 	if !replay.incomplete || replay.omittedEventCount != 2 {
 		t.Fatalf(
 			"invalid registers not reported: incomplete=%v omitted=%d",
@@ -479,12 +463,13 @@ func FuzzReplayEventLog(f *testing.F) {
 	f.Add(cryptoAgileEventLog(f, banks, measurement, invalid))
 	f.Add(cryptoAgileEventLogHeader(f, banks))
 	f.Add([]byte{})
-	pcrs := quotedSHA256PCR(7, measurement)
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		if len(raw) > attestation.MaxEventLogSize {
 			t.Skip()
 		}
-		replay := replayEventLog(raw, pcrs, attestedPCRResults(), maxNormalizedEventBytes)
+		results := attestedPCRResults()
+		results[7].Pcr.Digest = extendedSHA256PCR(measurement)
+		replay := replayEventLog(raw, results)
 		for _, event := range replay.events {
 			if event.PcrIndex >= attestation.AttestedPCRCount {
 				t.Fatalf("normalized an event for unattested PCR %d", event.PcrIndex)

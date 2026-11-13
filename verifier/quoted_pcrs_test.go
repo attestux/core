@@ -193,18 +193,18 @@ func TestVerifyQuotedPCRsSelection(t *testing.T) {
 				[]*attestuxv1.PcrBankEvidence{attestationtest.MakeUnsupportedPCRBank(evidence, attestation.TPMAlgSHA1, 20)},
 				evidence.PcrBanks...,
 			)
-			pcrs, results, err := verifyQuotedPCRs(evidence, nonce)
+			results, err := verifyQuotedPCRs(evidence, nonce)
 			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) || len(pcrs)+len(results) != 0 {
-					t.Fatalf("got %d PCRs, %d results, error %v; want no PCRs and error %q", len(pcrs), len(results), err, test.wantError)
+				if err == nil || !strings.Contains(err.Error(), test.wantError) || len(results) != 0 {
+					t.Fatalf("got %d results, error %v; want no results and error %q", len(results), err, test.wantError)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("rejected a fully covering quote: %v", err)
 			}
-			if len(pcrs) != attestation.AttestedPCRCount || len(results) != attestation.AttestedPCRCount {
-				t.Fatalf("got %d PCRs and %d results", len(pcrs), len(results))
+			if len(results) != attestation.AttestedPCRCount {
+				t.Fatalf("got %d results", len(results))
 			}
 		})
 	}
@@ -288,9 +288,9 @@ func TestVerifyQuotedPCRsForgedQuote(t *testing.T) {
 		{name: "no nonce", evidence: overNonce(nil), wantError: "nonce"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			pcrs, results, err := verifyQuotedPCRs(test.evidence(t), expected)
-			if err == nil || !strings.Contains(err.Error(), test.wantError) || len(pcrs)+len(results) != 0 {
-				t.Fatalf("%d PCRs, %d results, error %v; want %q and no PCRs", len(pcrs), len(results), err, test.wantError)
+			results, err := verifyQuotedPCRs(test.evidence(t), expected)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) || len(results) != 0 {
+				t.Fatalf("%d results, error %v; want %q and no results", len(results), err, test.wantError)
 			}
 		})
 	}
