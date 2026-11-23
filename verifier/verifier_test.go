@@ -34,52 +34,60 @@ func TestUnsupportedPCRBankWarning(t *testing.T) {
 	}
 }
 
-func TestRejectActivationClearsChallenge(t *testing.T) {
-	session, _, _ := newQuoteTestSession(t)
-	nonce := session.expectedQuoteNonce
-	report, err := session.RejectActivation()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.Status !=
-		attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-		!slices.Equal(report.Errors, []string{"TPM credential activation failed: prover reported credential activation failure"}) {
-		t.Fatalf("unexpected rejected report: %v", report)
-	}
-	requireActivationFinished(t, session, nonce)
-}
-
-func TestRejectEvidence(t *testing.T) {
-	session, _, _ := newQuoteTestSession(t)
-	nonce := session.expectedQuoteNonce
-	initial := session.Report()
-	report, err := session.RejectEvidence()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-		!slices.Equal(report.Errors, []string{"prover reported attestation failure"}) || describesTrust(report) ||
-		!bytes.Equal(report.EvidenceSha256, initial.EvidenceSha256) {
-		t.Fatalf("incorrect attestation-failure report: %v", report)
-	}
-	requireActivationFinished(t, session, nonce)
-}
-
-func TestPrepareVerificationInvalidKeys(t *testing.T) {
-	e := attestationtest.MinimallyShapedEvidence()
-	e.Keys.EndorsementKeys = nil
-	session := PrepareVerification(marshalHello(t, e.Keys))
-	if report := session.Report(); report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED || !containsMessage(report.Errors, "invalid endorsement-key count") {
-		t.Fatalf("invalid keys were accepted: %v", report)
+func TestRejectActivationAndEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		reject func(*VerificationSession) (*resultv1.VerificationReport, error)
+		want   string
+	}{
+		{"activation", (*VerificationSession).RejectActivation, "TPM credential activation failed: prover reported credential activation failure"},
+		{"evidence", (*VerificationSession).RejectEvidence, "prover reported attestation failure"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session, _, _ := newQuoteTestSession(t)
+			nonce := session.expectedQuoteNonce
+			initial := session.Report()
+			report, err := test.reject(session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
+				!slices.Equal(report.Errors, []string{test.want}) || describesTrust(report) ||
+				!bytes.Equal(report.EvidenceSha256, initial.EvidenceSha256) {
+				t.Fatalf("incorrect rejection report: %v", report)
+			}
+			requireActivationFinished(t, session, nonce)
+		})
 	}
 }
 
-func TestPrepareVerificationEmptyHello(t *testing.T) {
-	session := PrepareVerification(nil)
-	report := session.Report()
-	if session.ActivationChallenge() != nil || len(report.Errors) != 1 ||
-		!strings.Contains(report.Errors[0], "size 0 is outside permitted range") {
-		t.Fatalf("empty hello was not rejected by size: %v", report)
+func TestPrepareVerificationBadHello(t *testing.T) {
+	withoutEndorsements := attestationtest.MinimallyShapedEvidence().Keys
+	withoutEndorsements.EndorsementKeys = nil
+	for _, test := range []struct {
+		name string
+		raw  []byte
+		want string
+	}{
+		{"empty hello", nil, "size 0 is outside permitted range"},
+		// A future optional field makes the hello nonempty without supplying keys.
+		{"hello without keys", protowire.AppendBytes(protowire.AppendTag(nil, 100, protowire.BytesType), []byte{0x55}), "missing attestation keys"},
+		{"invalid keys", marshalHello(t, withoutEndorsements), "invalid endorsement-key count"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := PrepareVerification(test.raw)
+			report := session.Report()
+			if session.ActivationChallenge() != nil || report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
+				len(report.Errors) != 1 || !strings.Contains(report.Errors[0], test.want) {
+				t.Fatalf("hello was not rejected with %q: %v", test.want, report)
+			}
+			if sum := sha256.Sum256(test.raw); !bytes.Equal(report.EvidenceSha256, sum[:]) {
+				t.Fatal("early rejection report did not hash the full raw hello")
+			}
+			if _, err := CompletionForReport(report); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -159,23 +167,6 @@ func TestPrepareVerificationHelloSize(t *testing.T) {
 	}
 }
 
-func TestPrepareVerificationNoKeys(t *testing.T) {
-	// A future optional field makes the hello nonempty without supplying keys.
-	raw := protowire.AppendBytes(protowire.AppendTag(nil, 100, protowire.BytesType), []byte{0x55})
-	session := PrepareVerification(raw)
-	report := session.Report()
-	if session.ActivationChallenge() != nil || report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED ||
-		!containsMessage(report.Errors, "missing attestation keys") {
-		t.Fatalf("hello without keys was not rejected: %v", report)
-	}
-	if _, err := CompletionForReport(report); err != nil {
-		t.Fatal(err)
-	}
-	if sum := sha256.Sum256(raw); !bytes.Equal(report.EvidenceSha256, sum[:]) {
-		t.Fatal("early rejection report did not hash the full raw hello")
-	}
-}
-
 func TestFailReportTruncates(t *testing.T) {
 	report := &resultv1.VerificationReport{}
 	failReport(report, "%s", strings.Repeat("e", maxDiagnosticMessageBytes+1))
@@ -226,7 +217,7 @@ func softwareEvidenceWithFixture(
 	}
 	evidence := ak.unquotedEvidence(t)
 	evidence.PcrBanks[0].Pcrs[7].Digest = extendedSHA256PCR(events...)
-	evidence.Keys.EndorsementKeys = []*attestuxv1.EndorsementKey{fixture.issue(t, 2, nil)}
+	evidence.Keys.EndorsementKeys = []*attestuxv1.EndorsementKey{fixture.issue(t, nil)}
 	evidence.EventLog = cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, events...)
 	return evidence
 }
@@ -326,7 +317,7 @@ func TestSelectEndorsementPolicyNoPolicies(t *testing.T) {
 
 func TestSelectEndorsementPolicyInvalidPolicy(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
-	keys := []*attestuxv1.EndorsementKey{fixture.issue(t, 2, nil)}
+	keys := []*attestuxv1.EndorsementKey{fixture.issue(t, nil)}
 
 	for name, policies := range map[string][]verificationPolicy{
 		"no roots": {{
@@ -353,7 +344,7 @@ func TestSelectEndorsementPolicyInvalidPolicy(t *testing.T) {
 
 func TestSelectEndorsementPolicyFallback(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
-	keys := []*attestuxv1.EndorsementKey{fixture.issue(t, 2, nil)}
+	keys := []*attestuxv1.EndorsementKey{fixture.issue(t, nil)}
 	unrelated := verificationPolicy{
 		id:    attestuxv1.TrustPolicy_TRUST_POLICY_NUVOTON,
 		trust: certificateTrust{roots: x509.NewCertPool()},
@@ -614,7 +605,7 @@ func quoteResponse(t testing.TB, ak *softwareAK, evidence *attestuxv1.Attestatio
 func TestSelectEndorsementPolicyMultipleKeys(t *testing.T) {
 	fixture := newEndorsementCertificateFixture(t)
 	malformed := &attestuxv1.EndorsementKey{Certificate: []byte{0xff}}
-	certified := fixture.issue(t, 2, nil)
+	certified := fixture.issue(t, nil)
 	policies := []verificationPolicy{fixture.policy()}
 	publicSum := sha256.Sum256(fixture.publicDER)
 

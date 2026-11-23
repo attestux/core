@@ -3,6 +3,7 @@ package verifier
 import (
 	"bytes"
 	"crypto/sha256"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,7 +33,7 @@ func TestUnknownFields(t *testing.T) {
 				evidence.Keys.ProtoReflect().SetUnknown(unknown)
 				evidence.Keys.EndorsementKeys[0].ProtoReflect().SetUnknown(unknown)
 			}
-			hello := &attestuxv1.AttestationHello{Keys: keys, ProverNonce: bytes.Repeat([]byte{7}, attestation.ProverNonceSize)}
+			hello := &attestuxv1.AttestationHello{Keys: keys, ProverNonce: testProverNonce()}
 			if target == "hello" || target == "both" {
 				hello.ProtoReflect().SetUnknown(unknown)
 			}
@@ -65,9 +66,12 @@ func TestUnknownFields(t *testing.T) {
 }
 
 func TestCompleteEvidenceWrongNonceOrKeys(t *testing.T) {
+	const nonceMismatch = "verify TPM quote: nonce mismatch"
 	for _, test := range []struct {
 		name   string
 		change func(*testing.T, *VerificationSession, *softwareAK, *attestuxv1.AttestationEvidence) []byte
+		// The only diagnostic a nonce failure may leave, in the report and the receipt.
+		wantError string
 	}{
 		// A software AK can forge creation proofs and quotes; without credential
 		// activation for the certified EK, its quote cannot carry the required nonce.
@@ -75,22 +79,28 @@ func TestCompleteEvidenceWrongNonceOrKeys(t *testing.T) {
 			wrong := bytes.Clone(s.expectedQuoteNonce)
 			wrong[0] ^= 0xff
 			return quoteResponse(t, ak, e, wrong)
-		}},
+		}, nonceMismatch},
+		{"hash prefix", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
+			return quoteResponse(t, ak, e, s.expectedQuoteNonce[:20])
+		}, nonceMismatch},
+		{"hash with a trailing byte", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
+			return quoteResponse(t, ak, e, append(bytes.Clone(s.expectedQuoteNonce), 0))
+		}, nonceMismatch},
 		{"missing hash", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
 			return quoteResponse(t, ak, e, nil)
-		}},
+		}, nonceMismatch},
 		{"double hash", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
 			return quoteResponse(t, ak, e, attestation.ActivationQuoteNonce(s.expectedQuoteNonce))
-		}},
+		}, nonceMismatch},
 		{"different AK", func(t *testing.T, s *VerificationSession, _ *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
 			other := newSoftwareAK(t)
 			e.Keys.AttestationPublic = other.encodedPublic(t)
 			return quoteResponse(t, other, e, s.expectedQuoteNonce)
-		}},
+		}, ""},
 		{"different EK", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
 			e.Keys.EndorsementKeys[0].Certificate[0] ^= 0xff
 			return quoteResponse(t, ak, e, s.expectedQuoteNonce)
-		}},
+		}, ""},
 		{"forged signature", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
 			raw := quoteResponse(t, ak, e, s.expectedQuoteNonce)
 			var out attestuxv1.AttestationEvidence
@@ -99,10 +109,10 @@ func TestCompleteEvidenceWrongNonceOrKeys(t *testing.T) {
 			}
 			out.PcrBanks[0].Quote.Signature[len(out.PcrBanks[0].Quote.Signature)-1] ^= 0xff
 			return marshalEvidence(t, &out)
-		}},
+		}, ""},
 		{"hash without quote", func(t *testing.T, s *VerificationSession, ak *softwareAK, e *attestuxv1.AttestationEvidence) []byte {
 			return bytes.Clone(s.expectedQuoteNonce)
-		}},
+		}, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			session, ak, e := newQuoteTestSession(t)
@@ -121,49 +131,22 @@ func TestCompleteEvidenceWrongNonceOrKeys(t *testing.T) {
 			if report.DeviceId != "" || len(report.Pcrs)+len(report.Events)+len(report.Warnings) != 0 {
 				t.Fatalf("invalid response exposed identity or quote results: %v", report)
 			}
-			requireActivationFinished(t, session, nonce)
-		})
-	}
-}
-
-func TestNonceMismatchDiagnostics(t *testing.T) {
-	for _, mutation := range []string{"wrong nonce", "nonce prefix", "missing nonce", "long nonce"} {
-		t.Run(mutation, func(t *testing.T) {
-			session, ak, evidence := newQuoteTestSession(t)
-			defer session.Cancel()
-			expected := session.expectedQuoteNonce
-			received := bytes.Clone(expected)
-			switch mutation {
-			case "wrong nonce":
-				received[0] ^= 0xff
-			case "nonce prefix":
-				received = received[:20]
-			case "missing nonce":
-				received = nil
-			case "long nonce":
-				received = append(received, 0)
-			}
-			report, err := session.CompleteEvidence(quoteResponse(t, ak, evidence, received))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if report.Status != attestuxv1.VerificationStatus_VERIFICATION_STATUS_FAILED || report.DeviceId != "" || describesTrust(report) {
-				t.Fatalf("nonce mismatch made trust claims: %v", report)
-			}
-			completion, err := CompletionForReport(report)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for name, diagnostics := range map[string][]string{
-				"report":       completion.Report.Errors,
-				"receipt":      completion.Receipt.Errors,
-				"saved report": session.Report().Errors,
-			} {
-				if len(diagnostics) != 1 || diagnostics[0] != "verify TPM quote: nonce mismatch" {
-					t.Fatalf("%s must contain only the generic nonce-mismatch diagnostic: %q", name, diagnostics)
+			if test.wantError != "" {
+				completion, err := CompletionForReport(report)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for name, diagnostics := range map[string][]string{
+					"report":       completion.Report.Errors,
+					"receipt":      completion.Receipt.Errors,
+					"saved report": session.Report().Errors,
+				} {
+					if !slices.Equal(diagnostics, []string{test.wantError}) {
+						t.Fatalf("%s must contain only %q: %q", name, test.wantError, diagnostics)
+					}
 				}
 			}
-			requireActivationFinished(t, session, expected)
+			requireActivationFinished(t, session, nonce)
 		})
 	}
 }

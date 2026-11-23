@@ -43,7 +43,7 @@ func TestSimulatedTPMEndToEnd(t *testing.T) {
 		t.Fatalf("EK discovery: %v", err)
 	}
 	fixture := newEndorsementCertificateFixture(t)
-	keys := simulatorAttestationKeys(ak, fixture.issueFor(t, 2, eks[0].Public, nil))
+	keys := simulatorAttestationKeys(ak, fixture.issueFor(t, eks[0].Public, nil))
 	policies := []verificationPolicy{{id: attestuxv1.TrustPolicy_TRUST_POLICY_ATTESTUX_SIMULATOR, limitation: SimulatorLimitation, trust: certificateTrust{roots: fixture.roots}}}
 	prepare := func(t *testing.T, k *attestuxv1.AttestationKeys) *VerificationSession {
 		t.Helper()
