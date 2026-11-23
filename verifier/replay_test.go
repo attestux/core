@@ -181,54 +181,43 @@ func TestReplayEventLogInitialPCR(t *testing.T) {
 	}
 }
 
-func TestReplayEventLogQuirkWarning(t *testing.T) {
-	logged := logEvent{
-		pcrIndex:  5,
-		eventType: 5,
-		data:      []byte("logged PCR 5 measurement"),
-	}
-	assumed := []logEvent{
-		{pcrIndex: 5, data: []byte("Exit Boot Services Invocation")},
-		{pcrIndex: 5, data: []byte("Exit Boot Services Returned with Success")},
-	}
+func TestReplayEventLogUnloggedEntries(t *testing.T) {
+	logged := logEvent{pcrIndex: 5, eventType: 5, data: []byte("logged PCR 5 measurement")}
 	raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, logged)
-	results := sha256PCRResult(5, append([]logEvent{logged}, assumed...)...)
-	replay := replayEventLog(raw, results)
+	for _, test := range []struct {
+		name    string
+		assumed []logEvent
+		warning string
+	}{
+		{"log explains the PCR", nil, ""},
+		{"quirk-assisted replay", []logEvent{
+			{pcrIndex: 5, data: []byte("Exit Boot Services Invocation")},
+			{pcrIndex: 5, data: []byte("Exit Boot Services Returned with Success")},
+		}, "assuming 2 entries the event log does not contain"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			results := sha256PCRResult(5, append([]logEvent{logged}, test.assumed...)...)
+			replay := replayEventLog(raw, results)
 
-	if !results[0].EventLogReplayed {
-		t.Fatalf("PCR 5 result = %+v, want the workaround to complete the replay", results[0])
-	}
-	if !results[0].ReplayUsedUnloggedEvents {
-		t.Fatalf("PCR 5 result = %+v, want the workaround persisted in the report", results[0])
-	}
-	if !containsMessage(replay.warnings, "assuming 2 entries the event log does not contain") {
-		t.Fatalf("warnings = %q, want the unlogged-entry disclosure", replay.warnings)
-	}
-	if len(replay.events) != 1 {
-		t.Fatalf("normalized %d events, want only the logged one", len(replay.events))
-	}
-	for _, digest := range replay.events[0].Digests {
-		if digest.State != resultv1.ReplayState_REPLAY_STATE_VERIFIED {
-			t.Fatalf("logged event digest state = %v, want verified", digest.State)
-		}
-	}
-}
-
-func TestReplayEventLogNoWarning(t *testing.T) {
-	logged := logEvent{
-		pcrIndex:  5,
-		eventType: 5,
-		data:      []byte("logged PCR 5 measurement"),
-	}
-	raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, logged)
-
-	results := sha256PCRResult(5, logged)
-
-	if replay := replayEventLog(raw, results); len(replay.warnings) != 0 {
-		t.Fatalf("warnings = %q, want none", replay.warnings)
-	}
-	if results[0].ReplayUsedUnloggedEvents {
-		t.Fatalf("PCR 5 result = %+v, did not use unlogged events", results[0])
+			if !results[0].EventLogReplayed || results[0].ReplayUsedUnloggedEvents != (test.assumed != nil) {
+				t.Fatalf("PCR 5 result = %+v, want replayed with unlogged entries = %v", results[0], test.assumed != nil)
+			}
+			if test.warning == "" {
+				if len(replay.warnings) != 0 {
+					t.Fatalf("warnings = %q, want none", replay.warnings)
+				}
+			} else if !containsMessage(replay.warnings, test.warning) {
+				t.Fatalf("warnings = %q, want the unlogged-entry disclosure", replay.warnings)
+			}
+			if len(replay.events) != 1 {
+				t.Fatalf("normalized %d events, want only the logged one", len(replay.events))
+			}
+			for _, digest := range replay.events[0].Digests {
+				if digest.State != resultv1.ReplayState_REPLAY_STATE_VERIFIED {
+					t.Fatalf("logged event digest state = %v, want verified", digest.State)
+				}
+			}
+		})
 	}
 }
 
@@ -366,60 +355,43 @@ func TestReplayEventLogParseError(t *testing.T) {
 	}
 }
 
-func TestReplayEventLogUnattestedPCRs(t *testing.T) {
+func TestReplayEventLogOutOfScopePCRs(t *testing.T) {
 	attested := logEvent{pcrIndex: 7, eventType: 5, data: []byte("attested")}
-	raw := cryptoAgileEventLog(
-		t,
-		[]attest.HashAlg{attest.HashSHA256},
-		attested,
-		logEvent{pcrIndex: 23, eventType: 5, data: []byte("out of scope")},
-	)
-	pcrResults := attestedPCRResults()
-	pcrResults[7].Pcr.Digest = extendedSHA256PCR(attested)
-
-	replay := replayEventLog(raw, pcrResults)
-	if replay.incomplete || replay.omittedEventCount != 0 {
-		t.Fatalf(
-			"unattested register reported as an omission: incomplete=%v omitted=%d",
-			replay.incomplete,
-			replay.omittedEventCount,
-		)
-	}
-	if len(replay.warnings) != 0 {
-		t.Fatalf("unattested register warned: %v", replay.warnings)
-	}
-	if len(replay.events) != 1 || replay.events[0].PcrIndex != 7 {
-		t.Fatalf("normalized events = %+v, want only PCR 7", replay.events)
-	}
-}
-
-func TestReplayEventLogInvalidPCRIndex(t *testing.T) {
-	attested := logEvent{pcrIndex: 7, eventType: 5, data: []byte("attested")}
-	raw := cryptoAgileEventLog(
-		t,
-		[]attest.HashAlg{attest.HashSHA256},
-		attested,
-		logEvent{pcrIndex: 23, eventType: 5, data: []byte("valid but out of scope")},
-		logEvent{pcrIndex: attestation.MaxPCRCount, eventType: 5, data: []byte("invalid")},
-		logEvent{pcrIndex: ^uint32(0), eventType: 5, data: []byte("invalid maximum")},
-	)
-	pcrResults := attestedPCRResults()
-	pcrResults[7].Pcr.Digest = extendedSHA256PCR(attested)
-
-	replay := replayEventLog(raw, pcrResults)
-	if !replay.incomplete || replay.omittedEventCount != 2 {
-		t.Fatalf(
-			"invalid registers not reported: incomplete=%v omitted=%d",
-			replay.incomplete,
-			replay.omittedEventCount,
-		)
-	}
-	if len(replay.warnings) != 1 ||
-		!strings.Contains(replay.warnings[0], "2 entries with an invalid PCR index") {
-		t.Fatalf("invalid-register warning = %q", replay.warnings)
-	}
-	if len(replay.events) != 1 || replay.events[0].PcrIndex != 7 {
-		t.Fatalf("normalized events = %+v, want only PCR 7", replay.events)
+	unattested := logEvent{pcrIndex: 23, eventType: 5, data: []byte("valid but out of scope")}
+	for _, test := range []struct {
+		name    string
+		events  []logEvent
+		omitted uint32
+		warning string
+	}{
+		// Unattested registers are not omissions; invalid indices are.
+		{"unattested register", []logEvent{attested, unattested}, 0, ""},
+		{"invalid PCR indices", []logEvent{
+			attested,
+			unattested,
+			{pcrIndex: attestation.MaxPCRCount, eventType: 5, data: []byte("invalid")},
+			{pcrIndex: ^uint32(0), eventType: 5, data: []byte("invalid maximum")},
+		}, 2, "2 entries with an invalid PCR index"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := cryptoAgileEventLog(t, []attest.HashAlg{attest.HashSHA256}, test.events...)
+			results := attestedPCRResults()
+			results[7].Pcr.Digest = extendedSHA256PCR(attested)
+			replay := replayEventLog(raw, results)
+			if replay.incomplete != (test.omitted > 0) || replay.omittedEventCount != test.omitted {
+				t.Fatalf("incomplete=%v omitted=%d, want %d omitted entries", replay.incomplete, replay.omittedEventCount, test.omitted)
+			}
+			if test.warning == "" {
+				if len(replay.warnings) != 0 {
+					t.Fatalf("warnings = %q, want none", replay.warnings)
+				}
+			} else if len(replay.warnings) != 1 || !strings.Contains(replay.warnings[0], test.warning) {
+				t.Fatalf("warnings = %q, want one containing %q", replay.warnings, test.warning)
+			}
+			if len(replay.events) != 1 || replay.events[0].PcrIndex != 7 {
+				t.Fatalf("normalized events = %+v, want only PCR 7", replay.events)
+			}
+		})
 	}
 }
 

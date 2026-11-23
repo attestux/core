@@ -132,7 +132,7 @@ func prepareActivationSession(
 	public crypto.PublicKey,
 ) *VerificationSession {
 	t.Helper()
-	keys := simulatorAttestationKeys(ak, fixture.issueFor(t, 2, public, nil))
+	keys := simulatorAttestationKeys(ak, fixture.issueFor(t, public, nil))
 	raw := marshalHello(t, keys)
 	session := prepareVerificationWithPolicies(raw, []verificationPolicy{fixture.policy()}, fixture.now)
 	t.Cleanup(session.Cancel)
