@@ -8,6 +8,7 @@ fi
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 aar="${1}"
 simulator="${2:-false}"
+cd "${project_dir}"
 ndk_version="$(<ndk.version)"
 
 : "${ANDROID_HOME:?ANDROID_HOME must point to the Android SDK}"
@@ -18,7 +19,6 @@ export GOTOOLCHAIN
 # Empty GOFLAGS reuses saved flags: simulator tags could make production AARs
 # fail the trust check. Keep this override non-empty to block saved flags.
 export GOFLAGS=-buildvcs=false
-cd "${project_dir}"
 go build -o "${project_dir}/build/mobile-tools/" \
 	golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
 
