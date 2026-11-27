@@ -16,7 +16,7 @@ require (
 )
 
 require (
-	github.com/attestux/protocol-go v0.0.0-20261111204932-602a8b79b91b
+	github.com/attestux/protocol-go v0.0.0-20261127014204-e5737a733d60
 	github.com/google/go-attestation v0.6.4
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.11
